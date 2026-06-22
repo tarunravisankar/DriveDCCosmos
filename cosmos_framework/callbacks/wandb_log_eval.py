@@ -86,10 +86,13 @@ class WandbCallback(Callback):
 
         dataset_name = data_batch.get("dataset_name", "default")
 
-        # Handle case where dataset_name gets batched into a list
+        # Count-based packing loaders (e.g. PackingDataLoader) can pack several
+        # samples from the same dataset into one batch, so "dataset_name" comes
+        # back as a list with one entry per packed sample rather than per batch.
+        # All samples in this implementation come from a single named dataset,
+        # so the first entry is representative.
         if isinstance(dataset_name, list):
-            assert len(dataset_name) == 1, "dataset_name should be a list of 1"
-            dataset_name = dataset_name[0]
+            dataset_name = dataset_name[0] if dataset_name else "default"
 
         if dataset_name not in self.final_loss_log_per_dataset:
             self.final_loss_log_per_dataset[dataset_name] = _LossRecord()

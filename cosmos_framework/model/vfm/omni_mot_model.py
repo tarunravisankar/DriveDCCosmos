@@ -2790,8 +2790,16 @@ class OmniMoTModel(ImaginaireModel):
         )
 
     @torch.no_grad()
-    def validation_step(self, data_batch: dict[str, torch.Tensor], iteration: int):
-        pass
+    def validation_step(
+        self, data_batch: dict[str, torch.Tensor], iteration: int
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+        """Validation step: same flow-matching loss computation as training_step,
+        evaluated without gradients. The trainer's validate() loop already calls
+        model.eval() and wraps the whole pass in @torch.no_grad() before invoking
+        this, so reusing training_step's forward+loss here is safe — no optimizer
+        step or backward() happens inside training_step itself.
+        """
+        return self.training_step(data_batch, iteration)
 
     @torch.no_grad()
     def forward(self, xt, t):

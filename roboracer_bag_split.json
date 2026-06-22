@@ -1,0 +1,51 @@
+{
+  "train": [
+    "roboracer_20260212_222733",
+    "roboracer_20260212_223443",
+    "roboracer_20260312_233939",
+    "roboracer_20260312_234503",
+    "roboracer_20260312_234627",
+    "roboracer_20260312_234752",
+    "roboracer_20260312_234904",
+    "roboracer_20260312_235703",
+    "roboracer_20260312_235836",
+    "roboracer_20260312_235950",
+    "roboracer_20260313_000100",
+    "roboracer_20260313_000213",
+    "roboracer_20260313_000322",
+    "roboracer_20260313_000434",
+    "roboracer_20260313_000546",
+    "roboracer_20260313_000700",
+    "roboracer_20260313_001029",
+    "roboracer_20260313_001142",
+    "roboracer_20260313_001304",
+    "roboracer_20260313_001633",
+    "roboracer_20260313_001743",
+    "roboracer_20260313_001853",
+    "roboracer_20260313_002001",
+    "roboracer_20260313_002249",
+    "roboracer_20260313_002359",
+    "roboracer_20260313_002512",
+    "roboracer_20260313_002628",
+    "roboracer_20260313_002739",
+    "roboracer_20260313_003006",
+    "roboracer_20260313_003115",
+    "roboracer_20260313_003221"
+  ],
+  "test": [
+    "roboracer_20260312_234140",
+    "roboracer_20260312_235013",
+    "roboracer_20260312_235424",
+    "roboracer_20260313_002854"
+  ],
+  "eval": [
+    "roboracer_20260312_234335",
+    "roboracer_20260312_235533",
+    "roboracer_20260313_001416",
+    "roboracer_20260313_001524",
+    "roboracer_20260313_002111"
+  ],
+  "excluded_bad_bags": [
+    "roboracer_20260304_011430"
+  ]
+}

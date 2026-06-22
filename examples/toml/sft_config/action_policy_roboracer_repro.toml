@@ -1,0 +1,148 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# RoboRacer action-policy SFT — Cosmos3-Nano on UT Austin 1/10th-scale AV platform
+#
+# v2: clean retrain after fixing two root causes of "model never learns to turn":
+#   1. roboracer_stats.json was contaminated by odometry-glitch outliers and used
+#      quantile normalization, which clipped genuine turns far outside [-1,1].
+#      Now: stats recomputed from the train split only (clean, no leakage from
+#      test/eval bags), minmax normalization so every real turn maps into [-1,1].
+#   2. clip_norm=0.05 below was overriding the recipe's default 1.0 (DROID uses
+#      1.0) and was almost certainly suppressing gradients on the rare,
+#      previously-oversized turn examples even further. Removed; uses default.
+# Also resumes from the clean Cosmos3-Nano base (not the previous roboracer
+# checkpoint trained against broken stats), and adds a real train/test/eval
+# split (roboracer_bag_split.json) with validation enabled for early stopping.
+#
+# v3: v2 ran to its iter=2000 hard cap (~3.9 epochs) without a real early-stopping
+# trigger ever firing cleanly — best checkpoint (iter 350, val loss 0.522) still
+# mispredicted turn direction/magnitude on held-out test bags. Three changes here:
+#   1. Fixed a second framework gap: dataloader_val's underlying iterator was
+#      built once in JointDataLoader.__init__ and never reset, so it silently
+#      exhausted (0 batches, NaN loss) after ~iteration 700 for the rest of v2's
+#      run. trainer.validate() now resets it every call (cosmos_framework/trainer/__init__.py).
+#   2. Added curvature-based oversampling (RoboracerDataset.oversample_turns,
+#      train split only) — turning windows are a minority by raw count even
+#      after the normalization fix, so the model had little incentive to
+#      specialize on them.
+#   3. Raised max_iter to a 20-epoch ceiling (~22000 iters) as a safety net, not
+#      a target — early stopping (early_stopping_watchdog.py) should fire well
+#      before that if the curve turns, but won't act before iteration 5400
+#      (~5 epochs) since validation loss with only 5 eval bags is noisy enough
+#      early on that a 5-in-a-row worse streak can happen from noise alone.
+#   Starts a fresh job (not resuming v2) since the training distribution changed
+#   (oversampling) and v2's optimizer/scheduler trajectory was built without it.
+#
+# v4 (same job name "...v3" on purpose): v3's watchdog used --patience-epochs 5
+# (a practical override, not the professor's literal default of 20) and fired
+# at iteration 6200 — best loss never moved off iteration 800 (0.434) the whole
+# way out to 6200. To honor the literal 20-epoch non-decreasing-within-epsilon
+# window before stopping, this continuation uses --patience-epochs 20 (on the
+# watchdog relaunch) and max_iter is raised here to a 50-epoch ceiling (~54900
+# iters). Job name is deliberately left as "action_policy_roboracer_repro_v3"
+# (not bumped to v4) so this run resumes from v3's own
+# checkpoints/latest_checkpoint.txt (-> iter_000006200, model+optim+scheduler+
+# iteration all restored) instead of re-running the first 6200 iterations from
+# the base checkpoint again — see cosmos_framework/checkpoint/dcp.py
+# keys_to_resume_during_load(): when a job's own checkpoint dir already has
+# latest_checkpoint.txt, that takes the unconditional full-resume branch and
+# load_path/load_training_state/keys_to_skip_loading below are ignored.
+#
+# v5: checked iter_000006600 (val loss 0.484, close to v3/v4's best of 0.434)
+# against held-out test bags with check_roboracer_predictions.py, plotting
+# ground-truth-vs-predicted curvature/velocity and rotation/angular-velocity.
+# The model had converged to an almost input-independent default action
+# (~0.09-0.10 m/frame forward, near-zero yaw) regardless of whether the frame
+# was actually straight or a sharp turn — confirmed NOT an inference-sampling
+# artifact (re-ran with --num-steps 32 vs. the usual 4; predictions barely
+# changed). Diagnosis: v3/v4's curvature-based oversampling (1x/2x/5x tiers,
+# ~2.13x total dataset size) was too weak — straight-driving was still the
+# majority by weighted count, so predicting the "average" (mostly-straight)
+# action was a strong loss-minimizing local optimum even though it's wrong on
+# every real turn. Fixed in RoboracerDataset._OVERSAMPLE_TIERS: raised to
+# 1x/5x/20x (~199932 oversampled windows, ~6.3% straight-by-weighted-count).
+# Also rewrote early_stopping_watchdog.py per the professor's explicit
+# guidance: (a) two separate loops — an inner loop bucketing each raw
+# validation check into its epoch, an outer loop that runs the actual
+# best/patience comparison once per COMPLETED epoch (epoch-mean loss), not on
+# raw sub-epoch checks; (b) min_delta tightened to 0.001 (was 0.01); (c) no
+# artificial epoch ceiling like 50 — set far higher (1000 epochs) so early
+# stopping itself, not the ceiling, is what actually ends the run.
+# Fresh job (new name, not resuming v3/v4): the oversampling distribution
+# changed, and v3/v4's optimizer state was already biased toward the bad
+# "always-near-straight" optimum — resuming risked that bias persisting via
+# Adam's momentum even under the new data distribution.
+#
+# v6: tried porting av_imitation's continuous Gaussian-importance-weighting
+# scheme (target density / current density over curvature) in place of v5's
+# discrete 1x/5x/20x tiers, calibrated to preserve dataset size — but measured
+# it empirically first and found it only grows the dataset 1.22x with a ~50/50
+# straight/turn balance, much milder than either v3/v4 (2.13x) or v5 (2.85x,
+# 93% turning), because windows with *some* rotation are already 59% of the
+# raw data; the Gaussian fit to the whole nonzero distribution is dominated by
+# gentle corrections, diluting the boost to genuinely rare sharp turns. Per
+# the professor's guidance, oversampling is set aside for now entirely
+# (RoboracerDataset oversample_turns=False in action_policy_roboracer_nano.py)
+# to isolate variables — verify the normalization/validation-pipeline fixes on
+# their own first, since neither v3/v4's nor v5's oversampling tuning clearly
+# fixed (or was clearly the cause of) the "near-input-independent default
+# action" failure mode. iters_per_epoch reverts to 515 (32943 raw windows / 64
+# global batch) and the ceiling to 515000 (1000 epochs) accordingly.
+#
+# Env required:
+#   ROBORACER_TRAIN_ROOT=/scratch/tarunrav/roboracer_lerobot_train
+#   ROBORACER_EVAL_ROOT=/scratch/tarunrav/roboracer_lerobot_eval
+#   WAN_VAE_PATH=$HOME/cosmos-framework/examples/checkpoints/wan22_vae/Wan2.2_VAE.pth
+#   IMAGINAIRE_OUTPUT_ROOT=/scratch/tarunrav/cosmos-framework/outputs
+#   BASE_CHECKPOINT_PATH=/scratch/tarunrav/cosmos-framework/examples/checkpoints/Cosmos3-Nano
+
+[job]
+task         = "vfm"
+experiment   = "action_policy_roboracer_nano"
+project      = "cosmos3_action"
+group        = "action_sft"
+name         = "action_policy_roboracer_repro_v6"
+wandb_mode   = "offline"
+
+[model]
+precision = "bfloat16"
+
+[model.parallelism]
+# 8x A6000 48GB — match DROID intra-node shard count
+data_parallel_shard_degree     = 8
+data_parallel_replicate_degree = 1
+
+[model.activation_checkpointing]
+mode           = "full"
+save_ops_regex = ["fmha"]
+
+[model.compile]
+enabled = false   # disable for stability; enable after confirmed working
+
+[model.ema]
+enabled = false   # disable to save memory on 48GB cards
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[scheduler]
+cycle_lengths = [515000]
+warm_up_steps = [200]
+
+[trainer]
+max_iter     = 515000  # 1000-epoch (iters_per_epoch=515, oversampling disabled — see v6 note
+                        # above) safety-net ceiling per professor's guidance: not a target,
+                        # early stopping should fire well before this
+logging_iter = 10
+# run_validation / validation_iter=200 / max_val_iter=20 are set directly in
+# action_policy_roboracer_nano.py — not TOML-overridable (schema whitelist).
+
+[checkpoint]
+load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
+# Matches the py file's validation_iter=200 so every validated iteration has a
+# checkpoint on disk to roll back to once the validation loss starts rising.
+save_iter = 200
+
+[dataloader_train]
+max_samples_per_batch = 8   # conservative for 48GB A6000; increase if no OOM
