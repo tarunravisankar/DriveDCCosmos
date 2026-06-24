@@ -209,6 +209,23 @@ action_policy_roboracer_nano = LazyDict(
                             root="${oc.env:ROBORACER_TRAIN_ROOT}",
                             fps=15.0,
                             chunk_length=32,
+                            # joint: per-sample, randomly picks among forward_dynamics/
+                            # inverse_dynamics/policy (base_dataset.py _MODE_CHOICES) — matches
+                            # the reference DROID recipe's dataset default. inverse_dynamics
+                            # (v7) proved the competing-video-objective diagnosis correct (loss
+                            # dropped sharply, turn predictions tracked ground truth for the
+                            # first time all session) but is NOT deployable: it conditions on
+                            # the REAL future video frames, which don't exist yet on a live car
+                            # at inference time — the model was reading motion off footage that
+                            # already showed the outcome, not predicting before the outcome
+                            # exists. "policy" alone (v2-v6) is the deployable mode but failed
+                            # outright due to the competing objective. "joint" mixes in real
+                            # policy-mode samples (so the model is actually exposed to the
+                            # realistic "decide before you know what happens" task) alongside
+                            # inverse_dynamics/forward_dynamics samples (which seem to help it
+                            # learn the visual-motion<->action relationship) — same approach
+                            # DROID's own dataset uses by default.
+                            mode="joint",
                             action_normalization="minmax",  # train-split min/max so genuine turns map to exactly [-1,1]
                             use_image_augmentation=True,
                             # Disabled per professor's guidance: isolate variables and verify the
@@ -254,6 +271,11 @@ action_policy_roboracer_nano = LazyDict(
                             root="${oc.env:ROBORACER_EVAL_ROOT}",
                             fps=15.0,
                             chunk_length=32,
+                            # Deliberately NOT "joint"/"inverse_dynamics" — validation must measure
+                            # the actual deployable task (predict from past/current frame only,
+                            # no future frames available), or the val loss/early-stopping decision
+                            # would be just as misleading as it was for v7's inverse_dynamics runs.
+                            mode="policy",
                             action_normalization="minmax",
                             use_image_augmentation=False,
                             resolution="256",

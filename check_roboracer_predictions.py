@@ -383,9 +383,19 @@ def main():
         gt_action_raw = denormalize_action(gt_action_normalized, "minmax", stats)  # back to real units
 
         # Model-ready sample: resized/padded video, padded+normalized action,
-        # sequence_plan, raw_action_dim. "policy" mode has no action conditioning
-        # (see build_sequence_plan_from_mode), so the actual action values fed in
-        # are irrelevant to generation — zero them out like action_policy_server*.py does.
+        # sequence_plan, raw_action_dim. Deliberately tested in "policy" mode
+        # (only frame 0 is clean conditioning; frames 1-32 are noised/generated
+        # targets, regardless of the real future frames sitting in `video` —
+        # the diffusion sampler discards those positions' real values and
+        # starts them from noise) — this is the actual deployable task: predict
+        # from the current frame only, with no future frames available, the way
+        # a real car would at inference time. "inverse_dynamics" mode (used for
+        # v7) instead gives the model the REAL future frames as clean
+        # conditioning, which made predictions look dramatically better but
+        # isn't deployable — see session notes / RoboracerDataset.__init__ for
+        # the full reasoning. No action conditioning either way, so the actual
+        # action values fed in are irrelevant to generation — zero them out
+        # like action_policy_server*.py does.
         model_sample = sft_ds[idx]
         video = model_sample["video"]  # [C, T, H, W]
         action_zeros = torch.zeros_like(model_sample["action"])  # [32, 64]

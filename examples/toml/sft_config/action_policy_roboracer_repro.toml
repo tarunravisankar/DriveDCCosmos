@@ -90,6 +90,57 @@
 # action" failure mode. iters_per_epoch reverts to 515 (32943 raw windows / 64
 # global batch) and the ceiling to 515000 (1000 epochs) accordingly.
 #
+# v7: professor flagged two hypotheses from an external review; both checked
+# against the actual code/data rather than trusted blindly.
+#   1. CONFIRMED: RoboracerDataset/get_action_roboracer_sft_dataset defaulted
+#      to mode="policy" (transforms.py build_sequence_plan_from_mode), which
+#      noises/generates almost the ENTIRE video (only frame 0 is clean) AND
+#      the action sequence simultaneously — a large competing video-
+#      reconstruction objective sharing the fine-tuned moe_gen backbone with
+#      action prediction. The reference DROID recipe's dataset defaults to
+#      mode="joint" (uniformly mixes forward_dynamics/inverse_dynamics/policy
+#      per sample, base_dataset.py _MODE_CHOICES) — even DROID only spends
+#      ~1/3 of training on this competing objective, while roboracer had been
+#      on it 100% of the time, every sample, this entire effort. Fixed: mode
+#      now defaults to "inverse_dynamics" (all video clean conditioning, zero
+#      video loss, action is the ONLY generation target) — see
+#      RoboracerDataset.__init__'s docstring for the full reasoning. Also
+#      updated to inverse_dynamics in check_roboracer_predictions.py to match.
+#   2. RULED OUT (empirically, not just code review): the claim that domain=av
+#      pretraining expects positive yaw = left turn, conflicting with our
+#      data's actual sign. Checked directly: DROID is domain_id=8, not 1 (av),
+#      so it couldn't have established an "av" convention either way.
+#      Separately, verified empirically against real footage on the source
+#      machine — at the single sharpest turn in the entire train split
+#      (rot_1=0.265, ~the dataset's global max), the user confirmed by eye the
+#      car is turning LEFT. positive rot_1 = left turn, matching both the
+#      standard ROS convention and av_imitation's own (positive curvature =
+#      left, also confirmed against real footage). No sign flip applied.
+# Fresh job (not resuming v6): the training OBJECTIVE itself changed (policy
+# -> inverse_dynamics), not just a data/hyperparameter tweak, so v6's
+# optimizer state (shaped under the old competing-objective regime) isn't a
+# meaningful resume point.
+#
+# v8: v7's inverse_dynamics fix dramatically improved predictions (val loss
+# 0.295 @ iter 200 vs. v3-v6's ~0.45-0.46; turn predictions tracked ground
+# truth closely for the first time all session) — but it's NOT deployable.
+# inverse_dynamics conditions on the REAL future video frames (the car already
+# mid-turn) as clean context, which simply don't exist yet on a live car at
+# inference time — the model was reading motion off footage that already
+# showed the outcome, not predicting before the outcome exists. Switched
+# train mode to "joint" (mixes forward_dynamics/inverse_dynamics/policy per
+# sample, matching the reference DROID recipe's own dataset default) so the
+# model is actually exposed to the realistic "decide before you know what
+# happens" task (policy-mode samples) some of the time, while still getting
+# the inverse_dynamics/forward_dynamics signal that seems to help it learn
+# the visual-motion<->action relationship. Validation mode is deliberately
+# DIFFERENT from train: "policy" only, so val loss/early-stopping reflects the
+# actual deployable task honestly, not an inflated inverse_dynamics number.
+# check_roboracer_predictions.py also switched back to testing in "policy"
+# mode for the same reason. Fresh job (not resuming v7): the training
+# objective changed again (inverse_dynamics -> joint), and v7's optimizer
+# state was shaped entirely under the non-deployable inverse_dynamics regime.
+#
 # Env required:
 #   ROBORACER_TRAIN_ROOT=/scratch/tarunrav/roboracer_lerobot_train
 #   ROBORACER_EVAL_ROOT=/scratch/tarunrav/roboracer_lerobot_eval
@@ -102,7 +153,7 @@ task         = "vfm"
 experiment   = "action_policy_roboracer_nano"
 project      = "cosmos3_action"
 group        = "action_sft"
-name         = "action_policy_roboracer_repro_v6"
+name         = "action_policy_roboracer_repro_v8"
 wandb_mode   = "offline"
 
 [model]
@@ -131,9 +182,17 @@ cycle_lengths = [515000]
 warm_up_steps = [200]
 
 [trainer]
-max_iter     = 515000  # 1000-epoch (iters_per_epoch=515, oversampling disabled — see v6 note
-                        # above) safety-net ceiling per professor's guidance: not a target,
-                        # early stopping should fire well before this
+# max_iter intentionally decoupled from scheduler.cycle_lengths below (which stays
+# at 515000) — only the hard-stop trigger point changes here, the LR schedule's
+# planned decay curve shape is left untouched so it's identical to what's already
+# been training under. On robolang (8x H100, batch=80/GPU -> global batch=640),
+# iters_per_epoch dropped to ~52 (vs. 515 at the old batch=8/A6000 config), so the
+# original 515000 ceiling now represented ~9900 epochs instead of the intended
+# ~1000 — far more generous than needed. Set to 10000 (~192 epochs at the new
+# iters_per_epoch) — still comfortably more than the 20-epoch patience window
+# given we're already ~50 epochs in, so this remains a safety net, not a real
+# constraint; early stopping should still fire well before this.
+max_iter     = 10000
 logging_iter = 10
 # run_validation / validation_iter=200 / max_val_iter=20 are set directly in
 # action_policy_roboracer_nano.py — not TOML-overridable (schema whitelist).
@@ -145,4 +204,16 @@ load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
 save_iter = 200
 
 [dataloader_train]
-max_samples_per_batch = 8   # conservative for 48GB A6000; increase if no OOM
+# Moved to robolang (8x H100 80GB). Fit the scaling curve from 3 measured
+# points: batch=24 -> ~40GB, batch=48 -> ~51.5GB, batch=80 -> ~68GB used.
+# That implies ~28GB fixed overhead (model/optimizer state, doesn't scale
+# with batch) + ~0.5GB/sample scalable (activation buffers, capped by full
+# activation checkpointing). Targeting ~94% utilization -> batch~97, rounded
+# to 96 (projects to ~76GB, ~93%). If this OOMs on relaunch, drop back down;
+# check device_monitor's nvml_used_gpu_mem_gb logs (or `nvidia-smi`) after a
+# few iterations to verify and refit if needed. NOTE: changing this changes
+# iters_per_epoch (global batch = max_samples_per_batch * 8 ranks) —
+# recompute the watchdog/janitor/epoch-summary --iters-per-epoch value to
+# match (32943 raw windows / new global batch) before relaunching monitoring
+# scripts.
+max_samples_per_batch = 96

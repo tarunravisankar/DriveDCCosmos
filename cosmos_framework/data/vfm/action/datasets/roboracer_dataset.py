@@ -96,6 +96,25 @@ class RoboracerDataset(ActionBaseDataset):
         root: str,
         fps: float = 15.0,
         chunk_length: int = 32,
+        # "policy" is the only mode that matches what's actually available at
+        # live-deployment time: just the current/past frame, no future frames.
+        # It used to fail outright (v2-v6) because it ALSO noises/generates
+        # almost the entire video simultaneously with the action sequence — a
+        # large competing video-reconstruction objective sharing the same
+        # fine-tuned backbone (moe_gen) as action prediction. Switching to
+        # "inverse_dynamics" (v7, all video frames clean conditioning) proved
+        # that diagnosis correct and dramatically improved predictions — but
+        # inverse_dynamics conditions on the REAL future video frames, which
+        # don't exist yet on a live car, so it isn't deployable. The
+        # action_policy_roboracer_nano.py experiment config now explicitly
+        # passes mode="joint" for training (matching the reference DROID
+        # recipe's own default — mixes forward_dynamics/inverse_dynamics/
+        # policy per sample, base_dataset.py _MODE_CHOICES) and mode="policy"
+        # for validation (so the val loss/early-stopping decision reflects the
+        # real deployable task, not an inflated inverse_dynamics number).
+        # "policy" remains the class default here so any future caller that
+        # forgets to pass mode= gets the safe, deployable behavior rather than
+        # silently training/testing against future frames it won't have.
         mode: str = "policy",
         action_normalization: str = "minmax",
         use_image_augmentation: bool = False,
@@ -253,6 +272,7 @@ def get_action_roboracer_sft_dataset(
     root: str,
     fps: float = 15.0,
     chunk_length: int = 32,
+    mode: str = "policy",  # safe/deployable default — see RoboracerDataset.__init__
     action_normalization: str | None = None,
     use_image_augmentation: bool = False,
     oversample_turns: bool = False,
@@ -276,6 +296,7 @@ def get_action_roboracer_sft_dataset(
         root=root,
         fps=fps,
         chunk_length=chunk_length,
+        mode=mode,
         action_normalization=action_normalization,
         use_image_augmentation=use_image_augmentation,
         oversample_turns=oversample_turns,
