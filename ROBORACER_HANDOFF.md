@@ -25,9 +25,10 @@ abandoned due to resource contention crashes). SSH: `ssh tarunrav@robolang.csres
 - Datasets: `ROBORACER_TRAIN_ROOT=/scratch/tarunrav/roboracer_lerobot_train`,
   `ROBORACER_EVAL_ROOT=/scratch/tarunrav/roboracer_lerobot_eval`, test split at
   `/scratch/tarunrav/roboracer_lerobot_test`.
-- 5 background processes running (all via `setsid nohup ... &`, with
+- 6 background processes running (all via `setsid nohup ... &`, with
   `loginctl enable-linger tarunrav` enabled on robolang — see "Infra gotcha" below):
-  training, `early_stopping_watchdog.py`, `prune_roboracer_checkpoints.py`,
+  training, `early_stopping_watchdog.py`, `stall_watchdog.py` (new — see
+  "Silent hang" below), `prune_roboracer_checkpoints.py`,
   a wandb-sync loop, `roboracer_epoch_summary.py`.
 - wandb run: https://wandb.ai/tarun-vidyut-university-of-texas-at-austin/cosmos3_action/runs/4qjy09yw
   (offline mode locally, autosynced every 60s).
@@ -153,13 +154,47 @@ abandoned due to resource contention crashes). SSH: `ssh tarunrav@robolang.csres
   SIGKILL on our training via the kernel OOM killer. This is why we migrated
   to `robolang` (mostly dedicated to this group, though another user's vLLM
   job briefly occupied it too — coordinate before assuming GPUs are free).
-- **systemd session-kill**: on `robolang`, processes launched with plain
-  `nohup ... & disown` got killed when the launching SSH/Claude-Code session
-  ended, despite disown — likely systemd's `KillUserProcesses` behavior. Fixed
-  by running `loginctl enable-linger tarunrav` on robolang (now enabled) and
-  using `setsid nohup ... < /dev/null &` for new background launches (fully
-  detaches from any controlling session). If background jobs mysteriously die
-  again after an SSH session ends, check `loginctl show-user <user> -p Linger`.
+- **A real, still-not-fully-root-caused silent hang occurred once** on the v8
+  robolang run: training (8 ranks, `mode="joint"`) ran normally for ~2900
+  iterations, then one iteration (2944) completed abnormally fast (2.47s vs.
+  the usual ~16-18s), and the run then sat completely frozen for ~8 hours with
+  no error ever logged. Diagnosis when caught: all 8 rank processes in state
+  `R` pegging ~98% CPU each, all 8 GPUs at 0% utilization but still holding
+  full memory — the signature of a silent NCCL collective deadlock (one rank
+  never issues an expected collective op; the others busy-poll forever waiting
+  for it). Notably, `TORCH_NCCL_ASYNC_ERROR_HANDLING=1` is already set by
+  `cosmos_framework/utils/distributed.py`, and the 30-min heartbeat timeout
+  logged at startup — yet no abort/exception ever fired even 8 hours later,
+  so that safeguard didn't catch this particular hang. Leading (UNCONFIRMED —
+  would need a `py-spy` stack trace from inside the hang, which needs ptrace
+  permission we didn't have non-interactively) hypothesis: `mode="joint"`'s
+  `_choose_mode()` does an independent `random.choice(...)` per sample, per
+  DataLoader worker — different ranks can land on different modes
+  (forward_dynamics/inverse_dynamics/policy) for the "same" global step, and
+  if some code path outside the one `has_valid_tokens` dummy-loss guard in
+  `flow_matching.py` (whose comment literally says "to maintain backward graph
+  consistency across ranks") isn't equally protected, a rank could silently
+  diverge in its collective-op count. **Decided NOT to attempt synchronizing
+  mode choice across ranks** — doing this correctly inside async,
+  independently-seeded DataLoader workers (with no clean signal for "what
+  global iteration is this" inside `__getitem__`) is nontrivial, and risks
+  introducing a new, harder-to-detect bug for an unconfirmed root cause.
+  Instead, added **`stall_watchdog.py`** — purely observational (only the kill
+  action touches anything), watches for the training log file failing to grow
+  at all for >15 min while the process is still alive, and kills it so it can
+  be resumed instead of silently burning hours. If this fires again, the
+  recurrence pattern (does it always happen near a particular iteration count?
+  always under heavy validation? etc.) would be much better evidence than we
+  currently have for the real cause.
+- **systemd session-kill** (a real but probably-unrelated secondary issue
+  found while investigating the hang above): on `robolang`, processes launched
+  with plain `nohup ... & disown` got killed when the launching SSH/Claude-Code
+  session ended, despite disown — likely systemd's `KillUserProcesses`
+  behavior. Fixed by running `loginctl enable-linger tarunrav` on robolang
+  (now enabled) and using `setsid nohup ... < /dev/null &` for new background
+  launches (fully detaches from any controlling session). If background jobs
+  mysteriously die again after an SSH session ends, check
+  `loginctl show-user <user> -p Linger`.
 - **PID confusion**: `nohup CMD & echo $!` gives the PID of the actual `CMD`
   process when invoked directly over SSH, but gives a *wrapper* PID when
   invoked through some local tool-harness layers (seen on `robolidar`) — always
