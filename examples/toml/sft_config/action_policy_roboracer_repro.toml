@@ -141,6 +141,18 @@
 # objective changed again (inverse_dynamics -> joint), and v7's optimizer
 # state was shaped entirely under the non-deployable inverse_dynamics regime.
 #
+# v9: back on robolidar (8x A6000 48GB) rather than robolang (8x H100 80GB) —
+# different machine, separate /scratch, so reverted dataloader_train/max_iter
+# to the original A6000-safe values (batch=8, 515000-iter/1000-epoch ceiling)
+# rather than carrying over robolang's H100-specific VRAM-utilization tuning
+# (batch=96, max_iter=10000), which was fit to the H100's memory profile and
+# would very likely OOM on a 48GB card. Keeps the validated v8 fix (mode=
+# "joint" training / mode="policy" validation) — first checkpoint tested
+# (robolang's iter_000003000) got turn DIRECTION right on every held-out test
+# turn sample for the first time in a deployable (non-inverse_dynamics) mode,
+# magnitude still undershooting ~40-60%. Fresh job (not resuming anything) —
+# starting from the base checkpoint on this machine, same as v8 did on robolang.
+#
 # Env required:
 #   ROBORACER_TRAIN_ROOT=/scratch/tarunrav/roboracer_lerobot_train
 #   ROBORACER_EVAL_ROOT=/scratch/tarunrav/roboracer_lerobot_eval
@@ -153,7 +165,7 @@ task         = "vfm"
 experiment   = "action_policy_roboracer_nano"
 project      = "cosmos3_action"
 group        = "action_sft"
-name         = "action_policy_roboracer_repro_v8"
+name         = "action_policy_roboracer_repro_v9"
 wandb_mode   = "offline"
 
 [model]
@@ -182,17 +194,10 @@ cycle_lengths = [515000]
 warm_up_steps = [200]
 
 [trainer]
-# max_iter intentionally decoupled from scheduler.cycle_lengths below (which stays
-# at 515000) — only the hard-stop trigger point changes here, the LR schedule's
-# planned decay curve shape is left untouched so it's identical to what's already
-# been training under. On robolang (8x H100, batch=80/GPU -> global batch=640),
-# iters_per_epoch dropped to ~52 (vs. 515 at the old batch=8/A6000 config), so the
-# original 515000 ceiling now represented ~9900 epochs instead of the intended
-# ~1000 — far more generous than needed. Set to 10000 (~192 epochs at the new
-# iters_per_epoch) — still comfortably more than the 20-epoch patience window
-# given we're already ~50 epochs in, so this remains a safety net, not a real
-# constraint; early stopping should still fire well before this.
-max_iter     = 10000
+# Reverted to the original A6000 ceiling: 515000 iters = 1000 epochs at
+# iters_per_epoch=515 (32943 raw windows / 64 global batch, batch=8 x 8 ranks)
+# — per the professor's "near-unbounded, let early stopping decide" guidance.
+max_iter     = 515000
 logging_iter = 10
 # run_validation / validation_iter=200 / max_val_iter=20 are set directly in
 # action_policy_roboracer_nano.py — not TOML-overridable (schema whitelist).
@@ -204,16 +209,4 @@ load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
 save_iter = 200
 
 [dataloader_train]
-# Moved to robolang (8x H100 80GB). Fit the scaling curve from 3 measured
-# points: batch=24 -> ~40GB, batch=48 -> ~51.5GB, batch=80 -> ~68GB used.
-# That implies ~28GB fixed overhead (model/optimizer state, doesn't scale
-# with batch) + ~0.5GB/sample scalable (activation buffers, capped by full
-# activation checkpointing). Targeting ~94% utilization -> batch~97, rounded
-# to 96 (projects to ~76GB, ~93%). If this OOMs on relaunch, drop back down;
-# check device_monitor's nvml_used_gpu_mem_gb logs (or `nvidia-smi`) after a
-# few iterations to verify and refit if needed. NOTE: changing this changes
-# iters_per_epoch (global batch = max_samples_per_batch * 8 ranks) —
-# recompute the watchdog/janitor/epoch-summary --iters-per-epoch value to
-# match (32943 raw windows / new global batch) before relaunching monitoring
-# scripts.
-max_samples_per_batch = 96
+max_samples_per_batch = 8   # original A6000-safe value (v9, back on robolidar)
