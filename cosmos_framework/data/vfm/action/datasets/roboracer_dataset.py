@@ -19,6 +19,7 @@ Place this file at:
 
 from __future__ import annotations
 
+import os
 import random
 from pathlib import Path
 from typing import Any
@@ -43,6 +44,35 @@ _ACTION_COLS = [
 # Path to normalization stats (computed after conversion, see compute_stats.py)
 # For initial training, set action_normalization=None to skip normalization.
 _STATS_PATH = Path(__file__).parent / "stats" / "roboracer_stats.json"
+
+
+def roboracer_worker_init_fn(worker_id: int) -> None:
+    """DataLoader worker_init_fn — reseeds stdlib `random` per worker, and
+    registers a SIGUSR1 stack-dump handler for hang diagnosis.
+
+    PyTorch only auto-reseeds its own RNG per worker (via torch.initial_seed());
+    `random.choice()` in base_dataset.py's mode="joint" `_choose_mode()` uses the
+    stdlib `random` module, which is never reseeded by default. Without this, a
+    worker process's `random` state is whatever it inherited from the main
+    process at fork time, and (if persistent_workers=True) keeps evolving
+    silently across the entire run rather than per-epoch.
+
+    Also explicitly (re-)registers the SIGUSR1 faulthandler dump here rather
+    than relying solely on fork-inheritance from the main process — this is
+    the actual process where a per-sample hang (e.g. a stuck video decode)
+    would occur, and the main process's own dump can only show "waiting to
+    receive from a worker," not what the worker itself is stuck on.
+    """
+    import faulthandler
+    import signal as _signal
+
+    seed = torch.initial_seed() % (2**32)
+    random.seed(seed)
+    np.random.seed(seed)
+
+    rank = os.environ.get("RANK", "0")
+    dump_file = open(f"/tmp/roboracer_hang_trace_rank{rank}_worker{worker_id}.txt", "w")
+    faulthandler.register(_signal.SIGUSR1, file=dump_file, all_threads=True, chain=False)
 
 
 class RoboracerDataset(ActionBaseDataset):

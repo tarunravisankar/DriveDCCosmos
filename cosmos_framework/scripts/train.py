@@ -24,7 +24,9 @@ win over TOML).
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import os
+import signal
 import traceback
 
 import torch
@@ -184,6 +186,15 @@ def launch(config: Config, args: argparse.Namespace) -> None:
     # check doesn't actually do anything.
     with distributed_init():
         distributed.init()
+
+    # Dump every thread's Python stack trace to a per-rank file on SIGUSR1.
+    # No ptrace/sudo needed (same-user signal, like the SIGTERM our stall
+    # watchdog already sends) — lets us request a stack trace from a hung
+    # rank (`kill -USR1 <pid>`) to see exactly which call it's stuck in,
+    # since NCCL's own watchdog timeout doesn't catch hangs that occur
+    # below/outside tracked NCCL collective ops (e.g. dataloader IPC).
+    _fault_dump_file = open(f"/tmp/roboracer_hang_trace_rank{os.environ.get('RANK', '0')}.txt", "w")
+    faulthandler.register(signal.SIGUSR1, file=_fault_dump_file, all_threads=True, chain=False)
 
     # Apply --deterministic config-level overrides before validate/freeze/trainer-init
     # so (a) validate inspects the config the trainer will actually consume, and

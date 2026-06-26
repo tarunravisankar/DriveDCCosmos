@@ -40,7 +40,10 @@ from cosmos_framework.data.vfm.joint_dataloader import (
     PackingDataLoader,
     RankPartitionedDataLoader,
 )
-from cosmos_framework.data.vfm.action.datasets.roboracer_dataset import get_action_roboracer_sft_dataset
+from cosmos_framework.data.vfm.action.datasets.roboracer_dataset import (
+    get_action_roboracer_sft_dataset,
+    roboracer_worker_init_fn,
+)
 
 cs = ConfigStore.instance()
 
@@ -198,7 +201,18 @@ action_policy_roboracer_nano = LazyDict(
                 batch_size=1,
                 in_order=False,
                 num_workers=4,
-                persistent_workers=True,
+                # Was True: with no worker_init_fn, persistent workers' stdlib
+                # `random` state (used by mode="joint"'s _choose_mode()) never
+                # got reseeded across the run, instead silently carrying over
+                # every time the trainer's outer loop calls iter() again at
+                # each ~200-iter validation/checkpoint boundary. Suspected
+                # (not yet 100% confirmed) cause of a deterministic hang at
+                # exactly +144 iterations past every such boundary (v8,
+                # 2944/3144/3344). False here forces workers to be killed and
+                # freshly spawned (and re-seeded via worker_init_fn below) at
+                # every iterator reset instead of carrying stale state.
+                persistent_workers=False,
+                worker_init_fn=roboracer_worker_init_fn,
                 pin_memory=True,
                 prefetch_factor=4,
                 sampler=None,

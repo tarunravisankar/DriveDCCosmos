@@ -37,10 +37,22 @@ import argparse
 import os
 import re
 import signal
+import subprocess
 import time
 from pathlib import Path
 
 _DONE_RE = re.compile(r"Done with training")
+
+
+def _child_pids(parent_pid: int) -> list[int]:
+    """Direct children of a given PID."""
+    try:
+        out = subprocess.run(
+            ["ps", "--ppid", str(parent_pid), "-o", "pid="], capture_output=True, text=True, check=False
+        ).stdout
+        return [int(p) for p in out.split()]
+    except Exception:
+        return []
 
 
 def main() -> None:
@@ -96,8 +108,25 @@ def main() -> None:
             print(
                 f"[stall-watchdog] no log growth for {stalled_for:.0f}s "
                 f"(>= {args.stall_timeout_s}s) while pid {args.pid} is still alive — "
-                f"likely a silent hang (e.g. NCCL collective deadlock). Sending SIGTERM."
+                f"likely a silent hang. Sending SIGUSR1 to each rank (and its "
+                f"dataloader worker subprocesses) to dump stack traces (see "
+                f"/tmp/roboracer_hang_trace_rank*.txt and *_worker*.txt) before SIGTERM."
             )
+            rank_pids = _child_pids(args.pid)
+            print(f"[stall-watchdog] rank child pids: {rank_pids}")
+            all_targets = list(rank_pids)
+            for rpid in rank_pids:
+                worker_pids = _child_pids(rpid)
+                if worker_pids:
+                    print(f"[stall-watchdog] rank {rpid} worker pids: {worker_pids}")
+                all_targets.extend(worker_pids)
+            for tpid in all_targets:
+                try:
+                    os.kill(tpid, signal.SIGUSR1)
+                except ProcessLookupError:
+                    pass
+            time.sleep(5)  # give faulthandler time to write the dump files
+            print("[stall-watchdog] stack traces dumped. Sending SIGTERM to the launcher.")
             try:
                 os.kill(args.pid, signal.SIGTERM)
             except ProcessLookupError:
