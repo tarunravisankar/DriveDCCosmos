@@ -1,0 +1,75 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# Online distillation: frozen 7B teacher → 4B student
+# TACC Lonestar6, gpu-h100 partition (2×H100 80 GB per node, allocation iri25030)
+#
+# Differences from action_policy_roboracer_4b_tacc_h100.toml:
+#   - experiment = "action_policy_roboracer_distill"  (uses DistillOmniMoTModel)
+#   - data_parallel_shard_degree=2  (student only; teacher is non-FSDP on each rank)
+#   - max_samples_per_batch=48  (reduced vs pure 4B run to leave room for teacher)
+#   - activation_checkpointing mode="none" (80 GB has headroom; skip recompute overhead)
+#
+# Memory budget per rank (80 GB H100):
+#   teacher 7B bf16 (non-FSDP, full per rank):  ~14 GB
+#   student 4B bf16 (FSDP 2-way sharded):        ~ 4 GB weights + ~8 GB optimizer
+#   activations + misc buffers:                  ~ 8 GB
+#   ─────────────────────────────────────────────────────
+#   Total:                                       ~34 GB  ✓
+#
+# Required env vars (set in Slurm submit script):
+#   TEACHER_CHECKPOINT_PATH=<v10 iter_000007200 on TACC scratch>
+#   WAN_VAE_PATH=<Wan2.2_VAE.pth on TACC scratch>
+#   IMAGINAIRE_OUTPUT_ROOT=<output dir on TACC scratch>
+#   ROBORACER_TRAIN_ROOT=<train dataset root on TACC scratch>
+#   ROBORACER_EVAL_ROOT=<eval dataset root on TACC scratch>
+#   QWEN_4B_PATH=<Qwen3-VL-4B-Instruct dir on TACC scratch>
+#   (No BASE_CHECKPOINT_PATH needed — student backbone loaded via pretrained_weights)
+
+[job]
+task         = "vfm"
+experiment   = "action_policy_roboracer_distill"
+project      = "cosmos3_action"
+group        = "action_sft"
+name         = "action_policy_roboracer_distill_tacc_v1"
+wandb_mode   = "offline"
+
+[model]
+precision = "bfloat16"
+
+[model.parallelism]
+# Student only: 2-way FSDP across the 2 H100s.
+# Teacher is loaded non-FSDP (full weights on each rank).
+data_parallel_shard_degree     = 2
+data_parallel_replicate_degree = 1
+
+[model.activation_checkpointing]
+# H100 80 GB has enough headroom even with teacher in memory.
+mode           = "none"
+save_ops_regex = ["fmha"]
+
+[model.compile]
+enabled = false
+
+[model.ema]
+enabled = false
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[scheduler]
+cycle_lengths = [515000]
+warm_up_steps = [200]
+
+[trainer]
+max_iter     = 515000
+logging_iter = 10
+
+[checkpoint]
+load_path = ""
+save_iter = 200
+
+[dataloader_train]
+# 48 samples/batch × 2 GPUs = 96 global batch.
+# Reduced from 96 (pure 4B) to leave GPU memory headroom for the teacher forward pass.
+max_samples_per_batch = 48

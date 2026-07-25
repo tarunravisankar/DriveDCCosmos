@@ -22,6 +22,10 @@ session notes).
 
 Usage:
     python compute_roboracer_stats.py --train-root /scratch/tarunrav/roboracer_lerobot_train
+    # or, combining multiple datasets (e.g. when training on more than one
+    # source via PackingDataLoader's multi-dataset config):
+    python compute_roboracer_stats.py \\
+        --train-root /scratch/tarunrav/roboracer_lerobot_train /scratch/tarunrav/roboracer_lerobot_train_orin13
 """
 
 import argparse
@@ -30,6 +34,7 @@ import math
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pyarrow.parquet as pq
 
 _ACTION_COLS = [
@@ -44,7 +49,14 @@ MAX_YAW_DELTA_DEG = 45.0
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--train-root", type=Path, default=Path("/scratch/tarunrav/roboracer_lerobot_train"))
+    parser.add_argument(
+        "--train-root",
+        type=Path,
+        nargs="+",
+        default=[Path("/scratch/tarunrav/roboracer_lerobot_train")],
+        help="One or more LeRobot train-split roots; stats are computed over their combined rows "
+             "(e.g. when training on multiple datasets via PackingDataLoader's multi-dataset config).",
+    )
     parser.add_argument(
         "--out",
         type=Path,
@@ -52,14 +64,26 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    table = pq.read_table(args.train_root / "data" / "chunk-000" / "file-000.parquet")
-    df = table.to_pandas()
+    # episode_index resets to 0 within each separately-converted root, so a plain
+    # concat would collide episode indices across roots. Tag rows with their
+    # source root before concatenating, and group on (root, episode_index) below.
+    dfs = []
+    for root_idx, root in enumerate(args.train_root):
+        table = pq.read_table(root / "data" / "chunk-000" / "file-000.parquet")
+        root_df = table.to_pandas()
+        root_df["_root_idx"] = root_idx
+        dfs.append(root_df)
+        print(f"Loaded {len(root_df)} rows from {root}")
+    df = dfs[0] if len(dfs) == 1 else pd.concat(dfs, ignore_index=True)
 
     # Drop the synthetic zero placeholder at the last frame of every episode.
-    last_frame_mask = df.groupby("episode_index")["frame_index"].transform("max") == df["frame_index"]
+    last_frame_mask = (
+        df.groupby(["_root_idx", "episode_index"])["frame_index"].transform("max") == df["frame_index"]
+    )
     kept = df[~last_frame_mask].copy()
+    n_episodes = len(df[["_root_idx", "episode_index"]].drop_duplicates())
     print(f"Loaded {len(df)} rows, dropped {last_frame_mask.sum()} synthetic last-frame zero rows "
-          f"({df['episode_index'].nunique()} episodes), {len(kept)} remain")
+          f"({n_episodes} episodes across {len(args.train_root)} root(s)), {len(kept)} remain")
 
     actions = kept[_ACTION_COLS].to_numpy(dtype=np.float32)  # [N, 9]
     yaw_delta_deg = np.degrees(np.arctan2(actions[:, 4], actions[:, 3]))

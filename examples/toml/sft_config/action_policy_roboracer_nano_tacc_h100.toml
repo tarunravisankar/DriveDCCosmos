@@ -1,0 +1,61 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# RoboRacer Nano SFT — TACC Lonestar6 H100 variant (2x H100 80GB).
+#
+# Resumes from v10 (iter 7200) — same job name so latest_checkpoint.txt
+# triggers automatic full resume (model + optimizer + scheduler + iteration).
+#
+# Key differences from action_policy_roboracer_repro.toml (robolidar 8x A6000):
+#   - data_parallel_shard_degree=2    (only 2 GPUs on TACC)
+#   - max_samples_per_batch=96        (H100 80GB vs A6000 48GB)
+#   - activation_checkpointing=none   (80GB has headroom; remove if OOM)
+#   - iters_per_epoch: 32943 / (96 × 2) = 171  (ceiling stays 515000)
+#
+# Env required (set in slurm script):
+#   WAN_VAE_PATH, IMAGINAIRE_OUTPUT_ROOT, ROBORACER_TRAIN_ROOT, ROBORACER_EVAL_ROOT
+
+[job]
+task         = "vfm"
+experiment   = "action_policy_roboracer_nano"
+project      = "cosmos3_action"
+group        = "action_sft"
+name         = "action_policy_roboracer_repro_v10"
+wandb_mode   = "offline"
+
+[model]
+precision = "bfloat16"
+
+[model.parallelism]
+data_parallel_shard_degree     = 2
+data_parallel_replicate_degree = 1
+
+[model.activation_checkpointing]
+mode           = "none"
+save_ops_regex = ["fmha"]
+
+[model.compile]
+enabled = false
+
+[model.ema]
+enabled = false
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[scheduler]
+cycle_lengths = [515000]
+warm_up_steps = [200]
+
+[trainer]
+max_iter     = 515000
+logging_iter = 10
+
+[checkpoint]
+# load_path ignored when latest_checkpoint.txt already exists (auto-resume).
+load_path = ""
+save_iter = 200
+
+[dataloader_train]
+# 96 samples/batch × 2 GPUs = 192 global batch.
+max_samples_per_batch = 96

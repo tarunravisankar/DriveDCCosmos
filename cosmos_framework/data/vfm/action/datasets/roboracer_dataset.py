@@ -46,9 +46,93 @@ _ACTION_COLS = [
 _STATS_PATH = Path(__file__).parent / "stats" / "roboracer_stats.json"
 
 
+def _decode_video_frames_pyav_direct(
+    video_path,
+    timestamps: list[float],
+    tolerance_s: float,
+    backend: str | None = None,
+) -> torch.Tensor:
+    """Drop-in replacement for lerobot's decode_video_frames using av.open() directly.
+
+    Bypasses torchvision.io.VideoReader, which uses PyAV with thread_type=FRAME
+    internally (set in C++) and deadlocks when the decode loop breaks before EOF
+    — the exact pattern in decode_video_frames_torchvision (pytorch/vision#9010).
+
+    av.open() in Python defaults to thread_type=SLICE, which is safe for early break.
+    Verified: setting CodecContext.thread_type as a class attribute does NOT affect
+    VideoReader because VideoReader initializes its codec in C++, bypassing Python
+    class-level attributes entirely. Bypassing VideoReader is the only reliable fix.
+    """
+    import av
+
+    video_path = str(video_path)
+    first_ts = min(timestamps)
+    last_ts = max(timestamps)
+
+    # Diagnostic: write the current video path to a per-worker file so we know
+    # exactly which file caused a hang if the worker gets stuck here.
+    _rank = os.environ.get("RANK", "?")
+    _wid = getattr(_decode_video_frames_pyav_direct, "_worker_id", "?")
+    _diag = f"/tmp/roboracer_decode_diag_rank{_rank}_w{_wid}.txt"
+    try:
+        with open(_diag, "w") as _f:
+            _f.write(f"{video_path}\nts={first_ts:.3f}-{last_ts:.3f}\n")
+    except Exception:
+        pass
+
+    loaded_frames: list[torch.Tensor] = []
+    loaded_ts: list[float] = []
+
+    with av.open(video_path) as container:
+        stream = container.streams.video[0]
+        # thread_type is already SLICE by default when opened via Python av.open(),
+        # but set it explicitly to guard against future PyAV version changes.
+        stream.codec_context.thread_type = "SLICE"
+
+        # Seek to the keyframe at or before first_ts.
+        if first_ts > 0.0:
+            container.seek(
+                int(first_ts / float(stream.time_base)),
+                stream=stream,
+                backward=True,
+                any_frame=False,
+            )
+
+        for frame in container.decode(stream):
+            current_ts = float(frame.pts * stream.time_base)
+            if current_ts < first_ts - tolerance_s:
+                continue
+            loaded_frames.append(
+                torch.from_numpy(frame.to_ndarray(format="rgb24")).permute(2, 0, 1)
+            )
+            loaded_ts.append(current_ts)
+            if current_ts >= last_ts:
+                break  # SLICE threading: safe to break before EOF
+
+    if not loaded_frames:
+        raise RuntimeError(
+            f"No frames decoded from {video_path} for timestamps {timestamps}"
+        )
+
+    query_ts = torch.tensor(timestamps)
+    loaded_ts_t = torch.tensor(loaded_ts)
+
+    dist = torch.cdist(query_ts[:, None], loaded_ts_t[:, None], p=1)
+    min_, argmin_ = dist.min(1)
+
+    assert (min_ < tolerance_s).all(), (
+        f"Frame timestamps violate tolerance ({min_[min_ >= tolerance_s]} > {tolerance_s})."
+        f"\nqueried: {query_ts}\nloaded: {loaded_ts_t}\nvideo: {video_path}"
+    )
+
+    closest_frames = torch.stack([loaded_frames[i] for i in argmin_])
+    return closest_frames.float() / 255.0
+
+
 def roboracer_worker_init_fn(worker_id: int) -> None:
-    """DataLoader worker_init_fn — reseeds stdlib `random` per worker, and
-    registers a SIGUSR1 stack-dump handler for hang diagnosis.
+    """DataLoader worker_init_fn — reseeds stdlib `random` per worker, patches
+    lerobot's video decoder to avoid the PyAV threading deadlock, and registers
+    a SIGUSR1 stack-dump handler for hang diagnosis.
 
     PyTorch only auto-reseeds its own RNG per worker (via torch.initial_seed());
     `random.choice()` in base_dataset.py's mode="joint" `_choose_mode()` uses the
@@ -73,6 +157,10 @@ def roboracer_worker_init_fn(worker_id: int) -> None:
     rank = os.environ.get("RANK", "0")
     dump_file = open(f"/tmp/roboracer_hang_trace_rank{rank}_worker{worker_id}.txt", "w")
     faulthandler.register(_signal.SIGUSR1, file=dump_file, all_threads=True, chain=False)
+
+    # Tag the worker_id onto the decode function so the diagnostic log can identify
+    # which worker was active when each file was opened.
+    _decode_video_frames_pyav_direct._worker_id = worker_id
 
 
 class RoboracerDataset(ActionBaseDataset):
@@ -271,7 +359,7 @@ class RoboracerDataset(ActionBaseDataset):
         from_ts = float(episode.get(f"videos/{_VIDEO_KEY}/from_timestamp", 0.0))
         abs_timestamps = [from_ts + ts for ts in timestamps]
 
-        frames = decode_video_frames(
+        frames = _decode_video_frames_pyav_direct(
             video_path,
             abs_timestamps,
             self._tolerance_s,

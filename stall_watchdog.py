@@ -65,16 +65,33 @@ def main() -> None:
         default=900.0,
         help=(
             "If the log file hasn't grown in this many seconds while the process is still "
-            "alive, treat it as a stall and kill it. Default 900s (15 min) is comfortably "
-            "longer than any legitimate validation+checkpoint-save pause observed so far "
-            "(~170-190s), but far shorter than letting a real hang run for hours."
+            "alive, treat it as a stall and kill it. Used after --warmup-duration-s elapses."
+        ),
+    )
+    parser.add_argument(
+        "--warmup-timeout-s",
+        type=float,
+        default=2400.0,
+        help="Stall timeout to use during the initial warmup window (default 2400s = 40 min).",
+    )
+    parser.add_argument(
+        "--warmup-duration-s",
+        type=float,
+        default=2700.0,
+        help=(
+            "How long (from watchdog launch) to use --warmup-timeout-s before switching "
+            "to --stall-timeout-s. Default 2700s = 45 min covers startup + cold validation "
+            "on start (~10-15 min) with headroom."
         ),
     )
     parser.add_argument("--interval-s", type=float, default=30.0)
     args = parser.parse_args()
 
+    launch_time = time.time()
     print(
-        f"Stall watchdog: pid={args.pid}, stall_timeout={args.stall_timeout_s}s, "
+        f"Stall watchdog: pid={args.pid}, "
+        f"warmup_timeout={args.warmup_timeout_s}s for first {args.warmup_duration_s}s, "
+        f"then stall_timeout={args.stall_timeout_s}s, "
         f"watching {args.log_file} for log growth"
     )
 
@@ -104,10 +121,13 @@ def main() -> None:
             continue
 
         stalled_for = now - last_growth_time
-        if stalled_for >= args.stall_timeout_s:
+        in_warmup = (now - launch_time) < args.warmup_duration_s
+        effective_timeout = args.warmup_timeout_s if in_warmup else args.stall_timeout_s
+        if stalled_for >= effective_timeout:
             print(
                 f"[stall-watchdog] no log growth for {stalled_for:.0f}s "
-                f"(>= {args.stall_timeout_s}s) while pid {args.pid} is still alive — "
+                f"(>= {effective_timeout:.0f}s {'warmup' if in_warmup else 'regular'} threshold) "
+                f"while pid {args.pid} is still alive — "
                 f"likely a silent hang. Sending SIGUSR1 to each rank (and its "
                 f"dataloader worker subprocesses) to dump stack traces (see "
                 f"/tmp/roboracer_hang_trace_rank*.txt and *_worker*.txt) before SIGTERM."
@@ -135,7 +155,7 @@ def main() -> None:
         else:
             print(
                 f"[stall-watchdog] no log growth for {stalled_for:.0f}s "
-                f"(threshold {args.stall_timeout_s}s) — watching."
+                f"(threshold {effective_timeout:.0f}s {'warmup' if in_warmup else 'regular'}) — watching."
             )
 
 

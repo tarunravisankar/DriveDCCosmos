@@ -1,0 +1,38 @@
+{
+  "train": [
+    "roboracer_20260702_173020",
+    "roboracer_20260702_173055",
+    "roboracer_20260702_173114",
+    "roboracer_20260702_173136",
+    "roboracer_20260702_173156",
+    "roboracer_20260702_173221",
+    "roboracer_20260702_173239",
+    "roboracer_20260702_173306",
+    "roboracer_20260702_173325",
+    "roboracer_20260702_173346",
+    "roboracer_20260702_173533",
+    "roboracer_20260702_173558",
+    "roboracer_20260702_173645",
+    "roboracer_20260702_173709",
+    "roboracer_20260702_173738",
+    "roboracer_20260702_173800",
+    "roboracer_20260702_173842",
+    "roboracer_20260702_173905",
+    "roboracer_20260702_173930",
+    "roboracer_20260702_173952",
+    "roboracer_20260702_174209",
+    "roboracer_20260702_174245",
+    "roboracer_20260702_174309",
+    "roboracer_20260702_174329"
+  ],
+  "eval": [
+    "roboracer_20260702_174351",
+    "roboracer_20260702_174414",
+    "roboracer_20260702_174436"
+  ],
+  "test": [
+    "roboracer_20260702_174500",
+    "roboracer_20260702_174522",
+    "roboracer_20260702_174544"
+  ]
+}

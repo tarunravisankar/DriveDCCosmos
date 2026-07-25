@@ -50,11 +50,23 @@ def _coerce_to_base_model(model_dict: dict[str, Any]) -> None:
     """For distillation training configs, rewrite the target to the base
     OmniMoTModel so the exported checkpoint only contains the student network."""
     target = model_dict.get("_target_", "")
-    if "OmniMoTModel" in target:
+    # Exact-suffix check: "DistillOmniMoTModel" also contains "OmniMoTModel" as
+    # a substring, so a plain `in` check here incorrectly treats distillation
+    # configs as already-base and skips the rewrite below, leaving the
+    # unexportable Distill target in place.
+    if target.endswith(".OmniMoTModel"):
         return
 
     log.info(f"Overriding model target from {target} to OmniMoTModel for export")
     model_dict["_target_"] = convert_target_to_string(OmniMoTModel)
+
+    # DistillOmniMoTModel.__init__ takes teacher_checkpoint_path/distill_alpha/
+    # teacher_experiment_name as top-level kwargs alongside `config` (not nested
+    # inside it) - base OmniMoTModel.__init__ only accepts `config`, so these
+    # must be dropped from model_dict itself, not just from model_dict["config"].
+    for k in list(model_dict.keys()):
+        if k not in ("_target_", "config") and not k.startswith("_"):
+            del model_dict[k]
 
     config = model_dict["config"]
     base_field_names = {f.name for f in attrs.fields(OmniMoTModelConfig)}

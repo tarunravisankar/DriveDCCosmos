@@ -98,4 +98,6 @@ def make_config() -> Config:
     import cosmos_framework.configs.base.experiment.sft.vision_sft_super  # noqa: F401
     import cosmos_framework.configs.base.experiment.action.posttrain_config.action_policy_droid_nano  # noqa: F401
     import cosmos_framework.configs.base.experiment.action.posttrain_config.action_policy_roboracer_nano  # noqa: F401
+    import cosmos_framework.configs.base.experiment.action.posttrain_config.action_policy_roboracer_4b  # noqa: F401
+    import cosmos_framework.configs.base.experiment.action.posttrain_config.action_policy_roboracer_distill  # noqa: F401
     return c

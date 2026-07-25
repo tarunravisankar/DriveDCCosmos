@@ -165,7 +165,7 @@ task         = "vfm"
 experiment   = "action_policy_roboracer_nano"
 project      = "cosmos3_action"
 group        = "action_sft"
-name         = "action_policy_roboracer_repro_v9"
+name         = "action_policy_roboracer_repro_v10"
 wandb_mode   = "offline"
 
 [model]

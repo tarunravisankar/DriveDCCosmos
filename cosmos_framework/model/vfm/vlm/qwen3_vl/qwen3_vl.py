@@ -603,7 +603,7 @@ class Qwen3VLPreTrainedModel(PreTrainedModel):
         "attentions": Qwen3VLTextAttention,
     }
 
-    def _init_weights(self, module: nn.Module, buffer_device: torch.device | None) -> None:
+    def _init_weights(self, module: nn.Module, buffer_device: torch.device | None = None) -> None:
         """Initialize the weights."""
         super()._init_weights(module)
 

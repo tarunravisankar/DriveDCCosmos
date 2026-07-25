@@ -1,0 +1,17 @@
+{
+  "train": [
+    "roboracer_20260224_235846",
+    "roboracer_20260225_002055",
+    "roboracer_20260310_000031",
+    "roboracer_20260310_001624",
+    "roboracer_20260310_002542",
+    "roboracer_20260311_162507"
+  ],
+  "test": [
+    "roboracer_20260311_171131"
+  ],
+  "eval": [
+    "roboracer_20260311_180120"
+  ],
+  "excluded_bad_bags": []
+}

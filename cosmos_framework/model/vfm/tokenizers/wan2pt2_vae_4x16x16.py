@@ -1011,7 +1011,19 @@ def _video_vae(
 
             # load checkpoint
             log.info(f"loading {pretrained_path}")
-            model.load_state_dict(ckpt, assign=TRAINING)
+            # `assign=True` is documented to swap meta parameters for the
+            # checkpoint's real tensors in place, but empirically leaves
+            # every parameter on meta when `model` was constructed under
+            # `with torch.device("meta")` above (verified: ckpt tensors are
+            # real cuda, key coverage is 100%, yet params stay meta right
+            # after this call returns) - a real vs. expected PyTorch
+            # behavior mismatch, not a checkpoint coverage gap. Sidestep it
+            # entirely with the traditional, more universally-correct
+            # pattern: materialize real (uninitialized) storage first via
+            # `to_empty`, then copy the checkpoint's values in normally.
+            if any(p.device.type == "meta" for p in model.parameters()):
+                model.to_empty(device=device)
+            model.load_state_dict(ckpt, assign=False)
         else:
             model.to_empty(device=device)
     # Ensure all params/buffers are contiguous on every rank before

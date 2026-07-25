@@ -1,0 +1,64 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# RoboRacer 4B — TACC H100 variant (2 GPUs, 80 GB each).
+#
+# Key differences from action_policy_roboracer_4b.toml (robolidar 8x A6000):
+#   - data_parallel_shard_degree=2  (only 2 GPUs)
+#   - max_samples_per_batch=96      (H100 80GB vs A6000 48GB — much more headroom)
+#   - activation_checkpointing mode="none"  (80GB is enough; skip recompute overhead)
+#   - iters_per_epoch changes: 32943 windows / (96 batch × 2 GPUs) = 171 iters/epoch
+#     → 515000 iter ceiling stays as a safety net; early stopping will fire earlier.
+#
+# Env required (set in Slurm script, not here):
+#   WAN_VAE_PATH=<path to Wan2.2_VAE.pth on TACC scratch>
+#   IMAGINAIRE_OUTPUT_ROOT=<path on TACC scratch>
+#   ROBORACER_TRAIN_ROOT=<path on TACC scratch>
+#   ROBORACER_EVAL_ROOT=<path on TACC scratch>
+
+[job]
+task         = "vfm"
+experiment   = "action_policy_roboracer_4b"
+project      = "cosmos3_action"
+group        = "action_sft"
+name         = "action_policy_roboracer_4b_tacc_v1"
+wandb_mode   = "offline"
+
+[model]
+precision = "bfloat16"
+
+[model.parallelism]
+data_parallel_shard_degree     = 2
+data_parallel_replicate_degree = 1
+
+[model.activation_checkpointing]
+# H100 80GB has enough headroom to skip activation recomputation.
+# Remove this block (or set mode="full") if you hit OOM.
+mode           = "none"
+save_ops_regex = ["fmha"]
+
+[model.compile]
+enabled = false
+
+[model.ema]
+enabled = false
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[scheduler]
+cycle_lengths = [515000]
+warm_up_steps = [200]
+
+[trainer]
+max_iter     = 515000
+logging_iter = 10
+
+[checkpoint]
+load_path = ""
+save_iter = 200
+
+[dataloader_train]
+# 96 samples/batch × 2 GPUs = 192 global batch.
+# Each sample is a 32-frame chunk; 192 chunks = ~6144 frames per step.
+max_samples_per_batch = 96

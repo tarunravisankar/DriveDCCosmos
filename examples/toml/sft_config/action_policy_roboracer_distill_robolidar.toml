@@ -1,0 +1,62 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# Online distillation: frozen Nano 7B teacher → 4B student
+# robolidar: 8×A6000 48 GB
+#
+# Memory budget per rank (48 GB A6000):
+#   teacher 7B bf16 (non-FSDP, full per rank):  ~14 GB
+#   student 4B bf16 (8-way FSDP, sharded):      ~ 1 GB weights + ~2 GB optimizer
+#   activations + batch (16 samples):            ~10 GB
+#   ─────────────────────────────────────────────────────
+#   Total:                                       ~27 GB  ✓ (leaves 21 GB margin)
+#
+# Paths default to robolidar (/scratch/tarunrav/...) via action_policy_roboracer_distill.py.
+# Override TEACHER_CHECKPOINT_PATH and QWEN_4B_PATH env vars if needed.
+
+[job]
+task         = "vfm"
+experiment   = "action_policy_roboracer_distill"
+project      = "cosmos3_action"
+group        = "action_sft"
+name         = "action_policy_roboracer_distill_v1"
+wandb_mode   = "offline"
+
+[model]
+precision = "bfloat16"
+
+[model.parallelism]
+data_parallel_shard_degree     = 8
+data_parallel_replicate_degree = 1
+
+[model.activation_checkpointing]
+# A6000 48 GB is tighter than H100 80 GB — use full recompute to save memory.
+mode           = "full"
+save_ops_regex = ["fmha"]
+
+[model.compile]
+enabled = false
+
+[model.ema]
+enabled = false
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[scheduler]
+cycle_lengths = [515000]
+warm_up_steps = [200]
+
+[trainer]
+max_iter     = 515000
+logging_iter = 10
+
+[checkpoint]
+load_path = ""
+save_iter = 200
+
+[dataloader_train]
+# 16 samples/batch × 8 GPUs = 128 global batch.
+# Conservative vs pure 4B run to leave headroom for teacher forward pass.
+# Increase to 24-32 if no OOM after first checkpoint.
+max_samples_per_batch = 16

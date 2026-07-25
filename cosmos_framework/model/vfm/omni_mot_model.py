@@ -149,7 +149,18 @@ class OmniMoTModel(ImaginaireModel):
         self.llm_special_tokens["eos_token_id"] = vlm_tokenizer.eos_token_id
 
         # 2. Vision tokenizer (images/videos) for generation.
-        self.tokenizer_vision_gen: VideoTokenizerInterface = lazy_instantiate(self.config.tokenizer)
+        # Force real-device tensor construction here regardless of any
+        # ambient meta-device context from an outer caller (e.g. HF's
+        # `from_pretrained` uses meta-device construction internally when
+        # `device_map`/`quantization_config` is passed). Without this,
+        # plain `torch.ones(...)`-style parameter init inside the tokenizer
+        # (e.g. RMS_norm.gamma in wan2pt2_vae_4x16x16.py) silently lands on
+        # meta, and its own checkpoint-loading path only fixes up tensors
+        # that are actual keys in the checkpoint - anything else stays
+        # stuck on meta until first use, crashing at inference time instead
+        # of at load time.
+        with torch.device(DEVICE):
+            self.tokenizer_vision_gen: VideoTokenizerInterface = lazy_instantiate(self.config.tokenizer)
         assert self.tokenizer_vision_gen.latent_ch == self.config.state_ch, (
             f"vision tokenizer latent_ch {self.tokenizer_vision_gen.latent_ch} != state_shape {self.config.state_ch}"
         )

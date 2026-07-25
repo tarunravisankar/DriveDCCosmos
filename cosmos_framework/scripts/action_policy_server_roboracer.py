@@ -17,7 +17,13 @@ Protocol (minimal, msgpack over websockets — no external `openpi` dependency):
   - on connection, the server sends an empty msgpack dict (metadata handshake,
     mirroring action_policy_server_robolab.py's convention);
   - each client message is a msgpack dict: {"image": <raw bytes, HxWx3 uint8
-    RGB row-major>, "shape": [H, W, 3]};
+    RGB row-major>, "shape": [H, W, 3], "direction": "left" | "right"
+    (optional, defaults to "left")};
+  - "direction" selects which trained text caption to condition on - the
+    model is trained on two datasets (orin10=left turns, orin13=right turns)
+    each with a distinct caption, since otherwise visually-similar
+    observations can map to different valid actions with no other
+    disambiguating signal (see _DIRECTION_CAPTIONS / action_policy_roboracer_nano.py);
   - each response is a msgpack dict:
       {"curvature": [32 floats], "velocity": [32 floats], "raw_action": [32x9 floats]}
 
@@ -62,6 +68,30 @@ _CHUNK_LENGTH = 32
 _RESOLUTION = "256"
 _MAX_ACTION_DIM = 64
 
+# Must exactly match the per-dataset captions written by convert_roboracer_to_lerobot.py's
+# --task-description for orin10 (left) / orin13 (right) — see action_policy_roboracer_nano.py.
+# Mapped from a short client-supplied token rather than accepting freeform text from the
+# client, so a typo/mismatch can't silently fall outside the training caption distribution.
+_DIRECTION_CAPTIONS = {
+    # Navigation — loop/track type (must exactly match convert_all_datasets.sh captions)
+    "loop_ccw":      "Drive the roboracer vehicle counter-clockwise around a large indoor loop.",
+    "loop_cw":       "Drive the roboracer vehicle clockwise around a large indoor loop.",
+    "oval_ccw":      "Drive the roboracer vehicle counter-clockwise around a large oval track.",
+    "circle_ccw":    "Drive the roboracer vehicle counter-clockwise around a circular track.",
+    "rect_small_ccw": "Drive the roboracer vehicle counter-clockwise around a small rectangular track.",
+    "rect_small_cw":  "Drive the roboracer vehicle clockwise around a small rectangular track.",
+    "rect_med_ccw":  "Drive the roboracer vehicle counter-clockwise around a medium rectangular track.",
+    "square_ccw":    "Drive the roboracer vehicle counter-clockwise around a square track.",
+    # Person avoidance — social navigation
+    "pass_right":    "Drive the roboracer vehicle and pass the person on the right.",
+    "pass_left":     "Drive the roboracer vehicle and pass the person on the left.",
+    "wait":          "Drive the roboracer vehicle and wait for the person to pass.",
+    # Legacy aliases (pre-v10 clients that send "left"/"right")
+    "left":          "Drive the roboracer vehicle counter-clockwise around a large indoor loop.",
+    "right":         "Drive the roboracer vehicle clockwise around a large indoor loop.",
+}
+_DEFAULT_DIRECTION = "loop_ccw"
+
 
 def to_curvature_velocity(actions_raw: np.ndarray, fps: float = 15.0) -> tuple[np.ndarray, np.ndarray]:
     """Same conversion as check_roboracer_predictions.py — matches the car's
@@ -91,19 +121,39 @@ class RoboracerPolicyService:
         maybe_init_distributed()
 
         log.info(f"[roboracer-policy-server] loading model from {checkpoint_path}")
-        setup_overrides = OmniSetupOverrides.model_validate({
-            "checkpoint_path": checkpoint_path,
-            "checkpoint_type": CheckpointType.DCP,
-            "experiment": "action_policy_roboracer_nano",
-            "experiment_overrides": [f"model.config.tokenizer.vae_path={vae_path}"],
-            "output_dir": "/tmp/cosmos3_action_server/roboracer",
-            "guardrails": False,
-            # Training disabled EMA — see check_roboracer_predictions.py for why.
-            "use_ema_weights": False,
-        })
-        setup_args = setup_overrides.build_setup()
-        pipe = OmniInference.create(setup_args)
-        self.model = pipe.model
+        checkpoint_type = CheckpointType.from_path(Path(checkpoint_path))
+        if checkpoint_type == CheckpointType.HF:
+            # OmniInference.create()'s DCP-bridge loader for HF checkpoints
+            # (torch.distributed.checkpoint.hf_storage) raises a spurious
+            # "Missing key: lm_head.weight" even though the key is present in
+            # the checkpoint's own safetensors index — root cause not yet
+            # isolated. Bypass it: load via the plain transformers
+            # `from_pretrained` path (proven to work for both bf16 and
+            # bitsandbytes-quantized exports in quantize_int4.py), then reach
+            # into the wrapper for the actual generation-capable network.
+            # This also transparently honors any quantization_config embedded
+            # in the checkpoint's own config.json (set automatically by
+            # `save_pretrained` after 4-bit loading).
+            from cosmos_framework.inference.model import Cosmos3OmniModel
+
+            hf_model = Cosmos3OmniModel.from_pretrained(
+                checkpoint_path, device_map={"": 0}, dtype=torch.bfloat16,
+            )
+            self.model = hf_model.model
+        else:
+            setup_overrides = OmniSetupOverrides.model_validate({
+                "checkpoint_path": checkpoint_path,
+                "checkpoint_type": CheckpointType.DCP,
+                "experiment": "action_policy_roboracer_nano",
+                "experiment_overrides": [f"model.config.tokenizer.vae_path={vae_path}"],
+                "output_dir": "/tmp/cosmos3_action_server/roboracer",
+                "guardrails": False,
+                # Training disabled EMA — see check_roboracer_predictions.py for why.
+                "use_ema_weights": False,
+            })
+            setup_args = setup_overrides.build_setup()
+            pipe = OmniInference.create(setup_args)
+            self.model = pipe.model
         self.model.eval()
 
         # Instantiate the real dataset only to read its fixed config (fps,
@@ -118,16 +168,12 @@ class RoboracerPolicyService:
         self._lock = threading.Lock()
         log.info("[roboracer-policy-server] ready")
 
-    def _build_live_sample(self, image_hwc_uint8: np.ndarray) -> dict:
-        """Build a raw (pre-ActionTransformPipeline) sample dict matching
-        RoboracerDataset._build_result's shape, from a single live frame.
+    def _build_live_sample(self, image_hwc_uint8: np.ndarray, caption: str) -> dict:
+        """Build a raw (pre-ActionTransformPipeline) sample dict from a single live frame.
 
-        Frames 1.._CHUNK_LENGTH are filled with the same current frame as a
-        placeholder — safe because mode="policy" noises/generates those video
-        positions regardless of their input value (see check_roboracer_predictions.py
-        and RoboracerDataset.__init__ for why this is the deployable mode).
-        Action is left as zeros for the same reason action conditioning is
-        irrelevant in mode="policy".
+        ``caption`` is the raw text string passed directly to the model as
+        ai_caption conditioning.  Use resolve_caption() to go from a direction
+        token or free-form text to a caption string before calling this.
         """
         if image_hwc_uint8.ndim != 3 or image_hwc_uint8.shape[-1] != 3:
             raise ValueError(f"image must be [H,W,3], got {image_hwc_uint8.shape}")
@@ -139,15 +185,30 @@ class RoboracerPolicyService:
             mode="policy",
             video=video,
             action=action,
-            ai_caption="Drive the roboracer vehicle.",
+            ai_caption=caption,
             additional_view_description=(
                 "A single front-facing camera mounted on a 1/10th-scale autonomous vehicle."
             ),
         )
 
-    def predict(self, image_hwc_uint8: np.ndarray) -> dict:
+    def predict(self, image_hwc_uint8: np.ndarray, direction: str = _DEFAULT_DIRECTION,
+                caption: str | None = None) -> dict:
+        """Run inference.  Prefer ``caption`` (raw text) over ``direction`` (token lookup).
+
+        If ``caption`` is provided it is used directly as the model's text
+        conditioning — this enables generalization testing with arbitrary prompts
+        the model was never explicitly trained on.  If only ``direction`` is
+        given it is resolved through _DIRECTION_CAPTIONS as before.
+        """
+        if caption is None:
+            if direction not in _DIRECTION_CAPTIONS:
+                raise ValueError(
+                    f"direction must be one of {list(_DIRECTION_CAPTIONS)}, got {direction!r}. "
+                    "Pass caption= for free-form text."
+                )
+            caption = _DIRECTION_CAPTIONS[direction]
         with self._lock:
-            raw_sample = self._build_live_sample(image_hwc_uint8)
+            raw_sample = self._build_live_sample(image_hwc_uint8, caption)
             # ActionSFTDataset/ActionTransformPipeline expects to operate on a
             # raw-dataset-shaped sample; reuse the dataset's own transform via
             # its underlying ActionSFTDataset wiring would require constructing
@@ -176,8 +237,13 @@ class RoboracerPolicyService:
                 "sequence_plan": [sequence_plan],
             }
             with torch.inference_mode():
+                # guidance=1.0 skips the classifier-free-guidance unconditional
+                # pass (was 3.0, effectively 2x forward passes per step) to cut
+                # per-call latency under shared-host contention; chunk_length/fps
+                # gives only ~2.13s of buffer, so inference must stay under that
+                # or the buffer runs dry and the client fail-safes mid-turn.
                 samples_out = self.model.generate_samples_from_batch(
-                    data_batch, guidance=3.0, seed=[0], num_steps=4, shift=5.0
+                    data_batch, guidance=1.0, seed=[0], num_steps=4, shift=5.0
                 )
             pred_action_normalized = samples_out["action"][0][:, :9].detach().cpu()
             pred_action_raw = denormalize_action(pred_action_normalized, "minmax", self._stats)
@@ -198,7 +264,16 @@ async def _serve(service: RoboracerPolicyService, host: str, port: int) -> None:
                 # "image" is raw bytes (HxWx3 uint8, row-major) + "shape" - far
                 # more efficient over the wire than a nested-list encoding.
                 image = np.frombuffer(obs["image"], dtype=np.uint8).reshape(obs["shape"])
-                result = await asyncio.get_event_loop().run_in_executor(None, service.predict, image)
+                # "caption" (raw text) takes priority over "direction" (token).
+                # Sending caption= enables free-form generalization testing.
+                raw_caption = obs.get("caption", None)
+                direction = obs.get("direction", _DEFAULT_DIRECTION)
+                log.info(
+                    f"[roboracer-policy-server] caption={raw_caption!r} direction={direction!r}"
+                )
+                result = await asyncio.get_event_loop().run_in_executor(
+                    None, service.predict, image, direction, raw_caption
+                )
                 await websocket.send(msgpack.packb(result))
             except Exception as exc:  # noqa: BLE001 - report errors to the client, keep server alive
                 log.warning(f"[roboracer-policy-server] request failed: {exc}")

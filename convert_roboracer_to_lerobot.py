@@ -26,6 +26,7 @@ Sources this is based on:
 
 import argparse
 import json
+import math
 import shutil
 import sqlite3
 import struct
@@ -45,10 +46,13 @@ DOMAIN_ID = 1          # from EMBODIMENT_TO_DOMAIN_ID["av"]
 ACTION_DIM = 9         # from EMBODIMENT_TO_RAW_ACTION_DIM["av"]
 TASK_DESCRIPTION = "Drive the roboracer vehicle to the goal location."
 
-# ROS2 bag topic IDs (confirmed from your bags)
-TOPIC_CAMERA = 2       # /camera_0/image_raw/compressed  (sensor_msgs/CompressedImage)
-TOPIC_ODOM = 7         # /odom                           (nav_msgs/Odometry)
-TOPIC_JOYSTICK = 5     # /joystick                       (sensor_msgs/Joy) - for reference
+# ROS2 bag topic names — resolved to each bag's own topic_id via _resolve_topic_id()
+# rather than hardcoded, since topic_id assignment depends on recording order/topic
+# list and is not guaranteed to match across differently-recorded bags (e.g. new
+# DAgger-correction recordings vs. the original dataset bags).
+TOPIC_CAMERA_NAME = "/camera_0/image_raw/compressed"  # sensor_msgs/CompressedImage
+TOPIC_ODOM_NAME = "/odom"                             # nav_msgs/Odometry
+TOPIC_JOYSTICK_NAME = "/joystick"                     # sensor_msgs/Joy - for reference
 
 # Odom pose offset in CDR-serialized nav_msgs/Odometry (confirmed empirically)
 ODOM_POSE_OFFSET = 44  # bytes: x(f64), y(f64), z(f64), qx(f64), qy(f64), qz(f64), qw(f64)
@@ -162,9 +166,23 @@ def decode_odom_pose(data: bytes):
     return None
 
 
+def _resolve_topic_id(cur: sqlite3.Cursor, topic_name: str) -> int:
+    """Look up a topic's id in this bag's own `topics` table by name.
+
+    topic_id assignment is per-bag (order topics were first seen during
+    recording), so a hardcoded id from one bag is not safe to assume for
+    another — resolving by name works regardless of recording order.
+    """
+    cur.execute("SELECT id FROM topics WHERE name=?", (topic_name,))
+    row = cur.fetchone()
+    if row is None:
+        raise ValueError(f"Topic {topic_name!r} not found in this bag's topics table")
+    return row[0]
+
+
 def read_bag(bag_path: Path):
     """Read all camera frames and odom messages from a bag.
-    
+
     Returns:
         frames: list of (timestamp_ns, jpeg_bytes)
         odom:   list of (timestamp_ns, x, y, z, qx, qy, qz, qw)
@@ -172,17 +190,20 @@ def read_bag(bag_path: Path):
     conn = sqlite3.connect(str(bag_path))
     cur = conn.cursor()
 
+    topic_camera = _resolve_topic_id(cur, TOPIC_CAMERA_NAME)
+    topic_odom = _resolve_topic_id(cur, TOPIC_ODOM_NAME)
+
     # Read camera frames
     cur.execute(
         "SELECT timestamp, data FROM messages WHERE topic_id=? ORDER BY timestamp",
-        (TOPIC_CAMERA,)
+        (topic_camera,)
     )
     raw_frames = cur.fetchall()
 
     # Read odom
     cur.execute(
         "SELECT timestamp, data FROM messages WHERE topic_id=? ORDER BY timestamp",
-        (TOPIC_ODOM,)
+        (topic_odom,)
     )
     raw_odom = cur.fetchall()
     conn.close()
@@ -259,10 +280,11 @@ class LeRobotV3Writer:
     - LeRobot v3.0 HF documentation
     """
 
-    def __init__(self, output_dir: Path, fps: int, video_key: str):
+    def __init__(self, output_dir: Path, fps: int, video_key: str, task_description: str = TASK_DESCRIPTION):
         self.output_dir = output_dir
         self.fps = fps
         self.video_key = video_key
+        self.task_description = task_description
 
         # Create directory structure
         (output_dir / "meta" / "episodes").mkdir(parents=True, exist_ok=True)
@@ -323,6 +345,7 @@ class LeRobotV3Writer:
         result = subprocess.run([
             'ffmpeg', '-y', '-i', str(tmp_path),
             '-c:v', 'libx264', '-crf', '18', '-preset', 'fast',
+            '-g', '30', '-keyint_min', '30', '-sc_threshold', '0',
             '-pix_fmt', 'yuv420p',
             str(video_path)
         ], capture_output=True)
@@ -358,7 +381,7 @@ class LeRobotV3Writer:
         # --- Episode metadata ---
         self.episode_rows.append({
             "episode_index": ep_idx,
-            "tasks": [TASK_DESCRIPTION],
+            "tasks": [self.task_description],
             "length": n_frames,
         })
 
@@ -384,7 +407,7 @@ class LeRobotV3Writer:
 
         # --- meta/tasks.parquet ---
         tasks_path = self.output_dir / "meta" / "tasks.parquet"
-        tasks_table = pa.Table.from_pylist([{"task_index": 0, "task": TASK_DESCRIPTION}])
+        tasks_table = pa.Table.from_pylist([{"task_index": 0, "task": self.task_description}])
         pq.write_table(tasks_table, tasks_path)
 
         # --- meta/info.json ---
@@ -440,12 +463,24 @@ class LeRobotV3Writer:
 # Main conversion
 # ---------------------------------------------------------------------------
 
-def convert(bags_dir: Path, output_dir: Path, fps: int, max_episodes: int = None, bag_names: list[str] | None = None):
+def convert(
+    bags_dir: Path,
+    output_dir: Path,
+    fps: int,
+    max_episodes: int = None,
+    bag_names: list[str] | None = None,
+    task_description: str = TASK_DESCRIPTION,
+    subgoal_lookahead_s: float = 5.0,
+):
     """Convert bags in bags_dir to LeRobot v3.0 format.
 
     Args:
         bag_names: If given, only convert bags whose parent directory name is in
             this list (e.g. a train/test/eval split) instead of every bag found.
+        task_description: Caption written to every episode's task / meta/tasks.parquet
+            for this output dataset. Lets separate datasets (e.g. different source
+            orins) carry distinct text conditioning for the same model to disambiguate
+            (see roboracer_dataset.py's per-episode ai_caption lookup).
     """
 
     # Find all .db3 files
@@ -473,7 +508,7 @@ def convert(bags_dir: Path, output_dir: Path, fps: int, max_episodes: int = None
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True)
 
-    writer = LeRobotV3Writer(output_dir, fps=fps, video_key=VIDEO_KEY)
+    writer = LeRobotV3Writer(output_dir, fps=fps, video_key=VIDEO_KEY, task_description=task_description)
     source_fps = 30.0  # approximate bag camera fps
 
     for bag_path in bag_files:
@@ -499,8 +534,36 @@ def convert(bags_dir: Path, output_dir: Path, fps: int, max_episodes: int = None
         # Compute 9D actions
         actions = compute_actions(poses)
 
-        # Extract JPEG bytes
+        # --- Subgoal goal dot annotation ---
+        # For each frame, project the odom position 5s ahead as a dot onto
+        # the camera image.  The dot is baked into the stored video so the
+        # model sees the goal direction at every training step without needing
+        # a separate goal-conditioning input modality.
         frames_jpeg = [jpeg for _, jpeg in frames]
+        if subgoal_lookahead_s > 0 and len(odom) >= 2:
+            from project_goal import compute_subgoal_poses, project_goal_onto_image
+            subgoals = compute_subgoal_poses(odom, lookahead_s=subgoal_lookahead_s)
+            odom_ts_arr = np.array([o[0] for o in odom], dtype=np.float64)
+
+            annotated = []
+            for (frame_ts, _), jpeg_bytes, pose in zip(frames, frames_jpeg, poses):
+                if pose is not None:
+                    rx, ry, _, qx_p, qy_p, qz_p, qw_p = pose
+                    ryaw = math.atan2(
+                        2 * (qw_p * qz_p + qx_p * qy_p),
+                        1 - 2 * (qy_p ** 2 + qz_p ** 2),
+                    )
+                    oi = int(np.argmin(np.abs(odom_ts_arr - frame_ts)))
+                    gx, gy = subgoals[oi]
+                    img = cv2.imdecode(np.frombuffer(jpeg_bytes, np.uint8), cv2.IMREAD_COLOR)
+                    if img is not None:
+                        img = project_goal_onto_image(img, rx, ry, ryaw, gx, gy)
+                        ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                        if ok:
+                            jpeg_bytes = buf.tobytes()
+                annotated.append(jpeg_bytes)
+            frames_jpeg = annotated
+            print(f"  Goal dots annotated (lookahead={subgoal_lookahead_s}s)")
 
         writer.write_episode(frames_jpeg, actions, episode_name)
 
@@ -546,6 +609,21 @@ if __name__ == "__main__":
         choices=["train", "test", "eval"],
         help="Which key of --bag-split-json to convert (required if --bag-split-json is given)"
     )
+    parser.add_argument(
+        "--task-description",
+        type=str,
+        default=TASK_DESCRIPTION,
+        help="Caption written to every episode's task / meta/tasks.parquet for this dataset "
+             "(default: the generic constant). Use a distinct value per source dataset to give "
+             "the model a text-conditioning signal for disambiguating different action distributions."
+    )
+    parser.add_argument(
+        "--subgoal-lookahead-s",
+        type=float,
+        default=5.0,
+        help="Seconds ahead to project as a subgoal dot on each frame (default 5.0). "
+             "Set to 0 to disable goal annotation."
+    )
     args = parser.parse_args()
 
     bag_names = None
@@ -561,4 +639,6 @@ if __name__ == "__main__":
         fps=args.fps,
         max_episodes=args.max_episodes,
         bag_names=bag_names,
+        task_description=args.task_description,
+        subgoal_lookahead_s=args.subgoal_lookahead_s,
     )

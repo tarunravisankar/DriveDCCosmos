@@ -31,7 +31,7 @@ _BATCH_TIMING_KEYS = {
 
 
 def custom_collate_fn(batch):
-    """
+    """1
     Collate function that works like default_collate for all keys other than "text_token_ids", "images", and "video".
     For "text_token_ids", "images", and "video" it simply returns them in a list, instead of stacking them as a tensor.
     """
@@ -809,7 +809,15 @@ class RankPartitionedDataLoader:
         self.dataset = dataset
 
     def __iter__(self):
-        return iter(self.dataloader)
+        # Cycle infinitely so PackingDataLoader never hits StopIteration mid-run.
+        # Without this, small datasets (e.g. 1639-window pass_right with
+        # max_samples_per_batch=96) exhaust after ~17 packed batches and cause
+        # PackingDataLoader's outer while-True to spin forever producing empty
+        # batches, silently hanging the rank while other ranks proceed.
+        # persistent_workers=False (already set) means workers are respawned
+        # per epoch, which is fine given how quickly these datasets reload.
+        while True:
+            yield from self.dataloader
 
     def __len__(self) -> int:
         return len(self.dataloader)
