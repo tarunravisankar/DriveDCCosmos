@@ -75,6 +75,15 @@ overrides needed. Those were specific to the old DCP-checkpoint loading
 path; the quantized checkpoint is HF-format and auto-detected, bypassing
 that path entirely (fixed this session — see `CLAUDE.md`).
 
+**Note on `--vae-path`:** for this HF/INT4 checkpoint type, the server only
+uses `--vae-path` when loading the *old* DCP format — for HF checkpoints it's
+accepted but silently unused. The VAE path that actually takes effect is
+whatever is baked into the checkpoint's own `tokenizer.vae_path` field in
+`model_best_4200_int4/config.json` (already pointed at `Wan2.2_VAE_fp16.pth`).
+If you ever move the model or VAE file elsewhere, edit that `config.json`
+directly (same `sed` shown in step 1's optional-copy block) — changing the
+`--vae-path` flag on the command line will not have any effect.
+
 If you see a Python traceback instead of "ready", stop — do not proceed to
 the car with an unconfirmed server. Capture the full traceback rather than
 guessing; several bugs found getting this checkpoint to serve had
@@ -208,6 +217,12 @@ the client for each token:
 python3 /tmp/social_baseline.py --server-ip 10.0.0.211 --server-port 18766 --live
 ```
 (drop `--live` to dry-run it first, same as the regular client.)
+
+Note: `social_baseline.py` accepts `--record-bag` on the command line but does
+**not** actually start a `ros2 bag record` process with it (verified in
+source — the flag is parsed but never used). If you want to record a DAgger
+bag, use `roboracer_chunk_buffered_client.py --record-bag ...` with a fixed
+`--direction` instead (step 8), not `social_baseline.py`.
 
 There's also a `--caption` flag on the regular client for free-form text
 outside the trained-token vocabulary above (e.g. `--caption "Drive the
