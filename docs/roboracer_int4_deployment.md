@@ -123,13 +123,27 @@ docker ps           # confirm orin_roboracer is up; if not, bring up at least th
 
 ## 5. Make sure the client + deps are ready in the container
 
+**Don't assume these files are already on the car** — if you're using a
+different physical car than the one this was developed on, `/home/orin/`
+won't have them yet. Their verified source location is on **robolang**
+(`/scratch/tarunrav/roboracer_chunk_buffered_client.py` and
+`/scratch/tarunrav/social_baseline.py` — confirmed present there; notably
+**not** present on robolidar). Copy them onto the car first, then into the
+container:
+
 ```bash
+# from robolang (or anywhere that can reach both robolang and the car)
+scp tarunrav@robolang.csres.utexas.edu:/scratch/tarunrav/roboracer_chunk_buffered_client.py \
+    tarunrav@robolang.csres.utexas.edu:/scratch/tarunrav/social_baseline.py \
+    orin@<car-ip-or-vpn-address>:/home/orin/
+
+# on the car
 docker cp /home/orin/roboracer_chunk_buffered_client.py orin_roboracer:/tmp/roboracer_chunk_buffered_client.py
 docker cp /home/orin/social_baseline.py orin_roboracer:/tmp/social_baseline.py
 ```
 
-(If `social_baseline.py` isn't already at `/home/orin/` on the car, copy it
-there first — same source location convention as the chunk-buffered client.)
+(If `/home/orin/` already has current copies on the car you're using, this
+step is a harmless no-op — just skip straight to the `docker cp` lines.)
 
 ## 5.5 Start navstack
 ```bash
