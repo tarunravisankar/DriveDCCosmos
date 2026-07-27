@@ -125,10 +125,20 @@ docker ps           # confirm orin_roboracer is up; if not, bring up at least th
 
 ```bash
 docker cp /home/orin/roboracer_chunk_buffered_client.py orin_roboracer:/tmp/roboracer_chunk_buffered_client.py
-docker exec orin_roboracer bash -lc 'python3 -c "import websockets" 2>/dev/null || python3 -m pip install --user --quiet websockets'
-docker exec -it orin_roboracer bash -l
+docker cp /home/orin/social_baseline.py orin_roboracer:/tmp/social_baseline.py
 ```
 
+(If `social_baseline.py` isn't already at `/home/orin/` on the car, copy it
+there first — same source location convention as the chunk-buffered client.)
+
+## 5.5 Start navstack
+```bash
+cd ~/roboracer_ws/tmux/navstack/
+tmuxinator
+```
+```bash
+pip install websockets # if needed
+```
 ## 6. Dry-run sanity check (inside the container shell)
 
 ```bash
@@ -181,7 +191,7 @@ you can observe all three behaviors in one run without manually restarting
 the client for each token:
 
 ```bash
-python3 social_baseline.py --server-ip 10.0.0.211 --server-port 18766 --live
+python3 /tmp/social_baseline.py --server-ip 10.0.0.211 --server-port 18766 --live
 ```
 (drop `--live` to dry-run it first, same as the regular client.)
 
