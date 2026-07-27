@@ -4,18 +4,21 @@ Goal: get the INT4-quantized, distilled 4B roboracer driving policy serving
 on robolidar, confirm it produces sane output, then drive the car with it
 and fold the new data back into training.
 
-You (the professor, or anyone with your own robolidar login) do **not** need
-to copy any multi-gigabyte model files anywhere — everything below runs
-directly off Tarun's already-readable files on robolidar's shared `/scratch`.
+**You need nothing except your own robolidar login.** No git clone, no venv,
+no `uv sync`, no bitsandbytes install, no re-running the export/quantization
+pipeline. The code, the Python environment, and the already-quantized model
+are all sitting on robolidar's shared `/scratch` under Tarun's account with
+world-readable permissions (verified `644`/`755` throughout every path
+involved) — any account on the machine can read and execute all of it
+directly. Step 2's launch command is the entire setup.
 
 ## 0. Prerequisites
 
 - Your own login on `robolidar.csres.utexas.edu`.
-- The car reachable over the lab's WireGuard VPN (see step 6).
-- Repo access to `git@github.com:tarunravisankar/DriveDCCosmos.git`
-  (`roboracer-action-policy` branch) if you need the client script or want
-  your own checkout — not required just to launch the server, since the
-  code already lives on robolidar under Tarun's account.
+- The car reachable over the lab's WireGuard VPN (see step 4).
+
+That's it. (A separate git checkout is only useful if you want to *edit*
+code — see the very end of this doc — not to run what's already there.)
 
 ## 1. Model files — no transfer needed
 
@@ -47,8 +50,8 @@ Check GPUs are free first:
 nvidia-smi
 ```
 
-Then, using Tarun's existing venv (or your own, set up per
-`git checkout roboracer-action-policy` + `uv sync --group cu130-train --extra train`):
+Then, using Tarun's existing venv directly — no setup, no `uv sync`, nothing
+to install:
 
 ```bash
 cd /scratch/tarunrav/cosmos-framework
@@ -135,7 +138,60 @@ python3 /tmp/roboracer_chunk_buffered_client.py --server-ip 10.0.0.211 --server-
 Watch the logged curvature/velocity for a bit — confirm it looks sane (no
 garbage, no constant clamping). Ctrl+C to stop.
 
-## 7. Drive live, recording the session
+## 7. Choosing a navigation or social behavior
+
+The server conditions on a text caption, selected via the client's
+`--direction` flag (a short token, mapped server-side to the exact trained
+caption string — typo-safe, since a free-form caption that doesn't
+character-for-character match a training caption falls outside the trained
+distribution). Default is `loop_ccw` if you omit the flag.
+
+| Token | Behavior |
+|---|---|
+| `loop_ccw` | Counter-clockwise around a large indoor loop |
+| `loop_cw` | Clockwise around a large indoor loop |
+| `oval_ccw` | Counter-clockwise around a large oval track |
+| `circle_ccw` | Counter-clockwise around a circular track |
+| `rect_small_ccw` | Counter-clockwise around a small rectangular track |
+| `rect_small_cw` | Clockwise around a small rectangular track |
+| `rect_med_ccw` | Counter-clockwise around a medium rectangular track |
+| `square_ccw` | Counter-clockwise around a square track |
+| `pass_right` | Pass a person on the right |
+| `pass_left` | Pass a person on the left |
+| `wait` | Wait for a person to pass |
+
+Pass it directly on any client invocation, e.g. to test the `pass_right`
+social behavior in dry-run:
+
+```bash
+python3 /tmp/roboracer_chunk_buffered_client.py --server-ip 10.0.0.211 --server-port 18766 --direction pass_right
+```
+
+or live, recording the session, driving a clockwise loop:
+
+```bash
+python3 /tmp/roboracer_chunk_buffered_client.py --server-ip 10.0.0.211 --server-port 18766 \
+  --live --direction loop_cw --record-bag roboracer_$(date +%Y%m%d_%H%M%S)_dagger
+```
+
+**The script that randomly cycles between the three social behaviors** (what
+you're likely thinking of) is `social_baseline.py` — it holds each of
+`pass_right` / `pass_left` / `wait` for ~5 seconds, cycling automatically, so
+you can observe all three behaviors in one run without manually restarting
+the client for each token:
+
+```bash
+python3 social_baseline.py --server-ip 10.0.0.211 --server-port 18766 --live
+```
+(drop `--live` to dry-run it first, same as the regular client.)
+
+There's also a `--caption` flag on the regular client for free-form text
+outside the trained-token vocabulary above (e.g. `--caption "Drive the
+roboracer vehicle to the elevator at the end of the hall."`) — this is for
+zero-shot generalization testing only, not a normal deployment path, since
+it isn't guaranteed to match anything the model was actually trained on.
+
+## 8. Drive live, recording the session
 
 ```bash
 python3 /tmp/roboracer_chunk_buffered_client.py --server-ip 10.0.0.211 --server-port 18766 \
@@ -146,9 +202,9 @@ Hold R1 to enable autonomous mode; nudge the joystick whenever you want to
 correct it (instantly overrides per-axis). When done, Ctrl+C — this stops
 driving and finalizes the bag cleanly.
 
-## 8. Get the bag off the car and into the conversion pipeline
+## 9. Get the bag off the car and into the conversion pipeline
 
-The bag lands in the current working directory of step 7, named
+The bag lands in the current working directory of step 8, named
 `roboracer_<timestamp>_dagger/`. Copy it wherever the other training bags
 live (same convention as the existing 31 train bags, so
 `convert_roboracer_to_lerobot.py --bags-dir` finds it alongside them):
@@ -157,7 +213,7 @@ live (same convention as the existing 31 train bags, so
 scp -r roboracer_20260628_120000_dagger <destination-matching-existing-bags-location>
 ```
 
-## 9. Convert and add to the train split
+## 10. Convert and add to the train split
 
 ```bash
 cd /scratch/tarunrav/cosmos-framework
@@ -171,7 +227,7 @@ python convert_roboracer_to_lerobot.py \
 Then add `"roboracer_20260628_120000_dagger"` to the `"train"` list in
 `roboracer_bag_split.json`.
 
-## 10. Resume fine-tuning on the updated dataset
+## 11. Resume fine-tuning on the updated dataset
 
 Same launch command as any other resume — `ROBORACER_TRAIN_ROOT` already
 points at the directory the new episode was just added to, so no extra flag
@@ -190,3 +246,21 @@ experiment (nano SFT or distillation) you're continuing.
 4. **Dry-run predictions look like garbage/constant clamping** — stop before
    going live; this means the model or preprocessing has a real problem,
    not something to push through.
+
+## If you want to edit code (not just run it)
+
+Everything above runs directly off Tarun's existing checkout and venv on
+robolidar — you're not editing anything there. If you want your own
+checkout to make changes:
+
+```bash
+git clone git@github.com:tarunravisankar/DriveDCCosmos.git
+cd DriveDCCosmos && git checkout roboracer-action-policy
+uv venv --python 3.13
+UV_CACHE_DIR=/tmp/uv_cache uv sync --group cu130-train --extra train
+UV_CACHE_DIR=/tmp/uv_cache VIRTUAL_ENV=.venv .venv/bin/uv pip install bitsandbytes
+```
+
+Then point `--checkpoint-path`/`--vae-path` at Tarun's existing model files
+(no need to copy those either, per step 1) while using your own venv to run
+the server.
