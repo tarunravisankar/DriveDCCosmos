@@ -476,6 +476,16 @@ class ImaginaireTrainer:
         """
         self.callbacks.on_validation_start(model, dataloader_val, iteration=iteration)
         model.eval()
+        # JointDataLoader-family loaders (PackingDataLoader, IterativeJointDataLoader)
+        # build their underlying per-stream iterators exactly once, in __init__ -- fine
+        # for dataloader_train (one continuous pass for the whole job), but a deterministic
+        # in_order=True dataloader_val legitimately exhausts that iterator after one full
+        # sweep over the (much smaller) eval set. Nothing reset it afterward, so every
+        # later validate() call got an already-exhausted iterator (silently 0 batches).
+        # Re-create the per-stream iterators here so every validation pass gets a fresh
+        # full sweep, regardless of how many validate() calls came before it.
+        if hasattr(dataloader_val, "dataloader_list") and hasattr(dataloader_val, "dataloaders"):
+            dataloader_val.dataloaders = [iter(dl) for dl in dataloader_val.dataloader_list]
         # Evaluate on the full validation set.
         with ema.ema_scope(model, enabled=model.config.ema.enabled):
             for val_iter, data_batch in enumerate(dataloader_val):

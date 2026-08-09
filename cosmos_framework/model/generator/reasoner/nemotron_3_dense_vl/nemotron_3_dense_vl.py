@@ -144,7 +144,7 @@ class Nemotron3DenseVLPreTrainedModel(PreTrainedModel):
     _supports_flash_attn = True
     _supports_sdpa = True
 
-    def _init_weights(self, module: nn.Module, buffer_device: torch.device | None) -> None:
+    def _init_weights(self, module: nn.Module, buffer_device: torch.device | None = None) -> None:
         super()._init_weights(module)
         if isinstance(module, MultiModalRotaryEmbedding):
             module.init_weights(buffer_device=buffer_device)

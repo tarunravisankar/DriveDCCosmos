@@ -401,6 +401,13 @@ def sync_model_states(
         return
     if process_group is None:
         process_group = _get_default_group()
+    # world_size==1 (e.g. a standalone single-process inference server) has
+    # nothing to sync -- "rank 0 to itself" is a no-op by definition, but
+    # attempting the broadcast/allgather collectives anyway can fail when the
+    # model is still under meta-device construction (no meta kernel registered
+    # for these ops), before real materialization happens.
+    if dist.get_world_size(process_group) <= 1:
+        return
     if not params_and_buffers_to_ignore:
         params_and_buffers_to_ignore = set()
 

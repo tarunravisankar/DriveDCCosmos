@@ -100,17 +100,35 @@ def _dataset_config_value(dataset_config: Any, key: str) -> Any:
 
 def _build_edge_policy_metadata(training_config: Any) -> dict[str, Any]:
     """Resolve policy manifest fields from the action experiment config."""
+    dataset_entries = None
     try:
         dataset_config = training_config.dataloader_train.dataloaders.action_data.dataloader.dataset
-    except AttributeError as exc:
-        raise ValueError(
-            "Cosmos3 Edge export requires an action dataset config at "
-            "dataloader_train.dataloaders.action_data.dataloader.dataset."
-        ) from exc
+        dataset_entries = _config_value(dataset_config, "list_of_datasets")
+    except AttributeError:
+        dataset_config = None
 
-    dataset_entries = _config_value(dataset_config, "list_of_datasets")
     if not dataset_entries:
-        raise ValueError("Cosmos3 Edge export requires at least one action dataset entry.")
+        # Fallback: PackingDataLoader shape used by the roboracer recipes,
+        #     dataloader_train.dataloader.datasets = {name: {"ratio": n, "dataset": cfg}}
+        # rather than the DROID/LIBERO
+        #     ...dataloaders.action_data.dataloader.dataset.list_of_datasets
+        # Normalised into the same [{"dataset": cfg}, ...] form the loop below expects.
+        try:
+            packed = training_config.dataloader_train.dataloader.datasets
+        except AttributeError:
+            packed = None
+        if packed:
+            dataset_entries = [
+                {"dataset": _config_value(entry, "dataset")}
+                for entry in (packed.values() if hasattr(packed, "values") else packed)
+            ]
+
+    if not dataset_entries:
+        raise ValueError(
+            "Cosmos3 Edge export requires at least one action dataset entry, at either "
+            "dataloader_train.dataloaders.action_data.dataloader.dataset.list_of_datasets "
+            "or dataloader_train.dataloader.datasets."
+        )
 
     metadata_by_dataset: list[dict[str, Any]] = []
     for entry in dataset_entries:

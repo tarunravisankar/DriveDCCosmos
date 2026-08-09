@@ -1030,7 +1030,15 @@ def _video_vae(
 
             # load checkpoint
             log.info(f"loading {pretrained_path}")
-            model.load_state_dict(ckpt, assign=TRAINING)
+            # `assign=True` is the documented way to materialize a meta-device
+            # model, but empirically does NOT work for this nested structure
+            # (Wan2pt2VAEInterface -> WanVAE -> WanVAE_): verified 100% key
+            # coverage with zero missing/unexpected keys, yet every parameter
+            # was still on `meta` after the call returned. Materialize with
+            # to_empty() first, then copy values in with standard semantics.
+            if any(p.device.type == "meta" for p in model.parameters()):
+                model.to_empty(device=device)
+            model.load_state_dict(ckpt, assign=False)
         else:
             model.to_empty(device=device)
 

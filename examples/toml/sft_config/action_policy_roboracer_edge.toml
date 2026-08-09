@@ -1,0 +1,85 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# RoboRacer action-policy SFT — Cosmos3-Edge (4B total / 2B active) on robolidar.
+#
+# Carries forward every validated decision from the Nano line (v10 /
+# action_policy_roboracer_repro.toml), changing only the model tier:
+#   * mode="joint" training, mode="policy" validation (the v8 fix — train on a
+#     mix of forward/inverse/policy dynamics, but early-stop strictly on the
+#     deployable policy-mode signal so the stopping criterion isn't inflated by
+#     inverse_dynamics' access to real future frames).
+#   * oversample_turns=False (the v6 decision — isolate variables).
+#   * minmax normalization from train-split-only stats.
+#
+# Why Edge instead of Nano:
+#   Measured peak for the deployed Nano-distilled 4B INT4 model was 9.20 GB
+#   allocated for a single inference call (6.03 GB weights + ~3.17 GB transient),
+#   which does not fit the car's 8 GB Jetson budget. Edge's bf16 weights are
+#   7.57 GB vs Nano's 16 GB.
+#
+#   Critically, Edge-Policy-DROID ships a *trained* generation expert and trained
+#   action bridges (its own config sets load_weights_from_pretrained=False), so
+#   this run does NOT need the teacher/student distillation detour that the
+#   cold-started Qwen3-VL-4B student required.
+#
+# Base checkpoint (already built):
+#   nvidia/Cosmos3-Edge-Policy-DROID -> convert_model_to_dcp -> 549 keys verified
+#   (action2llm/llm2action/action_modality_embed/time_embedder/vae2llm/llm2vae
+#   all present, plus 28 k_norm_und_for_gen and 281 *_moe_gen).
+#
+# Env required:
+#   WAN_VAE_PATH=/scratch/tarunrav/cosmos-framework/examples/checkpoints/wan22_vae/Wan2.2_VAE.pth
+#   IMAGINAIRE_OUTPUT_ROOT=/scratch/tarunrav/cosmos-edge/outputs
+#   BASE_CHECKPOINT_PATH=/scratch/tarunrav/cosmos-edge/examples/checkpoints/Cosmos3-Edge-Policy-DROID-dcp
+
+[job]
+task       = "vfm"
+experiment = "action_policy_roboracer_edge"
+project    = "cosmos3_action"
+group      = "action_sft"
+name       = "action_policy_roboracer_edge_v1"
+wandb_mode = "offline"
+
+[model]
+precision = "bfloat16"
+
+[model.parallelism]
+# 8x A6000 48GB — same intra-node shard count as the Nano line.
+data_parallel_shard_degree     = 8
+data_parallel_replicate_degree = 1
+
+[model.activation_checkpointing]
+mode           = "full"
+save_ops_regex = ["fmha"]
+
+[model.compile]
+enabled = false   # disable for stability; enable only after a clean run
+
+[model.ema]
+enabled = false   # disable to save memory on 48GB cards
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[scheduler]
+cycle_lengths = [515000]
+warm_up_steps = [200]
+
+[trainer]
+# Same near-unbounded ceiling as the Nano line — early stopping decides, not
+# this number. run_validation / validation_iter / max_val_iter are set in
+# action_policy_roboracer_edge.py (not TOML-overridable; schema whitelist).
+max_iter     = 515000
+logging_iter = 10
+
+[checkpoint]
+load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
+save_iter = 200
+
+[dataloader_train]
+# Starting at the A6000-safe Nano value for a like-for-like first comparison.
+# Edge is ~4x smaller than Nano, so this can very likely be raised substantially
+# once the first run's actual memory profile is observed — raise it from measured
+# device_monitor output rather than guessing.
+max_samples_per_batch = 8

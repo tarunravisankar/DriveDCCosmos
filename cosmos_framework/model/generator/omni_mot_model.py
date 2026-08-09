@@ -3400,8 +3400,24 @@ class OmniMoTModel(ImaginaireModel):
         )
 
     @torch.no_grad()
-    def validation_step(self, data_batch: dict[str, torch.Tensor], iteration: int):
-        pass
+    def validation_step(
+        self, data_batch: dict[str, torch.Tensor], iteration: int
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+        """Validation step: same flow-matching loss computation as training_step,
+        evaluated without gradients.
+
+        Upstream ships this as a bare ``pass`` (returns None), which makes
+        Trainer.validate()'s ``output_batch, loss = model.validation_step(...)``
+        raise "cannot unpack non-iterable NoneType object" whenever
+        ``run_validation=True``. Ported from the Nano-line tree, where the same
+        one-line delegation has been in use across the roboracer runs.
+
+        Reusing training_step is safe here: the trainer's validate() loop already
+        calls model.eval() and wraps the whole pass in @torch.no_grad() before
+        invoking this, and training_step itself performs no backward() or
+        optimizer step.
+        """
+        return self.training_step(data_batch, iteration)
 
     @torch.no_grad()
     def forward(self, xt, t):
