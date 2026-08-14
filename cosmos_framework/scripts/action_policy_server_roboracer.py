@@ -74,6 +74,10 @@ from cosmos_framework.scripts.action_policy_server_utils import maybe_init_distr
 from cosmos_framework.utils import log
 
 _CHUNK_LENGTH = 32
+# Minimum per-step arc length (metres) below which the car counts as stopped and
+# curvature is reported as zero rather than divided out. 1cm/step at 15fps is
+# 0.15 m/s -- well under the corpus mean step of 0.061 m (~0.92 m/s).
+_MIN_ARC_M = 1e-2
 _RESOLUTION = "256"
 _MAX_ACTION_DIM = 64
 
@@ -113,9 +117,16 @@ def to_curvature_velocity(actions_raw: np.ndarray, fps: float = 15.0) -> tuple[n
     dx = actions_np[:, 0]
     rot_0, rot_1 = actions_np[:, 3], actions_np[:, 4]
     yaw_delta = np.arctan2(rot_1, rot_0)
-    arc_length = np.maximum(np.sqrt(actions_np[:, 0] ** 2 + actions_np[:, 1] ** 2), 1e-3)
+    arc_length = np.sqrt(actions_np[:, 0] ** 2 + actions_np[:, 1] ** 2)
     velocity = dx / dt
-    curvature = yaw_delta / arc_length
+    # Curvature = yaw per unit distance travelled, so it is undefined for a
+    # stationary step -- and near-stationary steps are common and in-distribution
+    # (q01 of dx is exactly 0.0, from the `wait` dataset's stopped frames).
+    # Dividing by a floored arc_length turned those into enormous curvatures:
+    # a 0.003 rad yaw delta over a 1e-3 m arc reads as 3.0 1/m, which saturated
+    # the client's clamp and pinned the steering servo to full lock. A car that
+    # is not moving is not turning, so report zero curvature there instead.
+    curvature = np.where(arc_length > _MIN_ARC_M, yaw_delta / np.maximum(arc_length, _MIN_ARC_M), 0.0)
     return curvature, velocity
 
 
