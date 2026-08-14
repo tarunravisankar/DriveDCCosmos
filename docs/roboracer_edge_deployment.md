@@ -11,6 +11,14 @@ Everything lives in **`/scratch/tarunrav/cosmos-edge`** on **robolang**, which i
 a separate checkout from `/scratch/tarunrav/cosmos-framework`. The Nano tree is
 untouched and still serves the old model.
 
+> **Deploying to a car?** See **[`car_deploy/README.md`](../car_deploy/README.md)**
+> — a patch file plus the client, with the four fixes that stopped the car
+> driving into a wall. **orin10 already has all of them applied.**
+>
+> **Use the tethered path (§4).** On-car standalone inference loads and runs but
+> currently produces near-constant output that ignores the camera — see
+> "Known-broken: on-Jetson inference" in §7.
+
 ---
 
 ## 0. Which checkpoint, and why
@@ -438,27 +446,64 @@ worth testing before anything else.
 
 ## 7. What this model does and doesn't do
 
-Measured on held-out eval splits, 48 velocity-stratified samples, Spearman
-correlation between predicted and ground-truth forward velocity:
+All four held-out eval splits, 48 velocity-stratified samples each, Spearman
+correlation against ground truth. Run with
+`velocity_eval.py --dataset-root <a,b,c> --label <bf16|int4>`. At n=48 the
+p=0.05 threshold is **ρ ≈ 0.285**, so anything below that is not distinguishable
+from zero.
 
-| dataset | Edge (iter 2400) | Nano (iter 7200) |
-|---|---|---|
-| `wait` (social) | **+0.577** | +0.703 |
-| orin10 (nav loop) | **−0.046** | +0.503 |
+| split | velocity ρ (bf16) | velocity ρ (INT4) | yaw ρ (bf16) | yaw ρ (INT4) |
+|---|---|---|---|---|
+| `wait` | **+0.553** | **+0.502** | +0.166 | +0.107 |
+| `pass_right` | +0.056 | +0.152 | **+0.715** | **+0.723** |
+| `pass_left` | +0.097 | +0.155 | +0.322 | +0.282 |
+| orin10 (nav) | −0.046 | −0.056 | +0.271 | +0.287 |
 
-**Social behaviour works.** On `wait` the model tracks ground-truth velocity
-closely and outputs near-zero when the car should be stopped — at roughly 80% of
-Nano's fidelity with a 4x smaller text backbone.
+**Each social task is tracked on the axis that matters for it.** `wait` is a
+velocity task — stop for the person — and velocity tracks (+0.55). `pass_right`
+is a steering task — go around them — and steering tracks strongly (+0.72).
+Holding a roughly constant speed while passing is reasonable behaviour, not a
+failure. `pass_left` is markedly weaker than `pass_right` (+0.32 vs +0.72) and
+there is no explanation for the asymmetry yet.
 
-**Nav-loop velocity does not.** On orin10 the model outputs a roughly constant
-speed regardless of the frame, where Nano tracks it. Steering is comparable
-(yaw Spearman +0.271 Edge vs +0.287 Nano). Practically: expect the car to hold a
-roughly constant speed around the loop, and to slow/stop appropriately for people.
+**It under-brakes.** On `wait` the slow-half predicted mean is 0.053 against a
+fast-half 0.069 — a gap of +0.015 where ground truth is +0.054, i.e. about 29%
+of the correct magnitude. It does reach near-zero (predicted min −0.006), but it
+slows less than the demonstrations do. Do not rely on it to stop hard.
+
+**Nav-loop velocity does not track** (−0.046). Expect a roughly constant speed
+around the loop. Steering is weakly positive (+0.27, borderline).
+
+**INT4 costs nothing measurable.** Differences from bf16 are ≤0.10 and run in
+*both* directions across splits, and MAE is identical to three decimals
+(e.g. `wait` 0.0253 vs 0.0250). Serve INT4 without hesitation.
 
 Training was stopped by the relaunch guard rather than early stopping, but
 validation had not improved for 4,400 iterations, so more training of this recipe
 is unlikely to help. The remaining hypothesis is capacity (Edge runs a 2B-active
 text backbone vs Nano's 8B).
+
+### Known-broken: on-Jetson inference
+
+Every number above is from **x86**. On the Jetson the same checkpoint produces
+near-constant output that is independent of both the camera image and the
+direction token:
+
+| | Jetson | x86, identical checkpoint |
+|---|---|---|
+| curvature spread across 5 direction tokens | 0.008 | **1.614** |
+| curvature spread across 4 different frames | 0.006 | **1.105** |
+| first-step velocity | +4.15 (corpus max ≈3.0) | +0.06…+0.26 |
+
+Ruled out by measurement, not argument: INT4 quantization (bf16 and INT4 agree
+closely on x86); the UniPC CPU-solve fix (x86 velocities identical to the
+cuSOLVER path); SDPA dropping varlen boundaries (instrumented — 0 of 600+ calls
+passed any); causal mask top-left vs bottom-right (all causal calls are square);
+preprocessing config drift (configs byte-identical); corrupt transfer
+(`model.safetensors` md5 matches). The cause is somewhere in the Jetson
+numerical stack and is not yet localised.
+
+**Use the tethered path (§4) until this is resolved.**
 
 ---
 

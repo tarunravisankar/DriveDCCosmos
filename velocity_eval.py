@@ -100,7 +100,10 @@ def pearson(a, b):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint-path", required=True)
-    p.add_argument("--dataset-root", required=True)
+    # Comma-separated roots are evaluated in one process so the (slow) model
+    # load is amortised across datasets instead of repeated per split.
+    p.add_argument("--dataset-root", required=True,
+                   help="dataset root, or comma-separated list of roots")
     p.add_argument("--num-samples", type=int, default=48)
     p.add_argument("--experiment", default="action_policy_roboracer_edge")
     p.add_argument("--guidance", type=float, default=1.0)
@@ -109,33 +112,54 @@ def main():
     p.add_argument("--label", default="model")
     args = p.parse_args()
 
-    ds = RoboracerDataset(root=args.dataset_root, fps=15.0, chunk_length=32,
+    roots = [r for r in (s.strip() for s in args.dataset_root.split(",")) if r]
+
+    # Mirror action_policy_server_roboracer.py: auto-detect the checkpoint format
+    # so the same script can score the DCP training checkpoint and the exported
+    # HF/INT4 artifact. Previously this was pinned to DCP, which made it
+    # impossible to measure what quantization actually costs.
+    checkpoint_type = CheckpointType.from_path(Path(args.checkpoint_path))
+    print(f"[{args.label}] checkpoint type: {checkpoint_type}", flush=True)
+    if checkpoint_type == CheckpointType.HF:
+        from cosmos_framework.inference.model import Cosmos3OmniModel
+
+        hf_model = Cosmos3OmniModel.from_pretrained(
+            args.checkpoint_path, device_map={"": 0}, dtype=torch.bfloat16,
+        )
+        model = hf_model.model
+    else:
+        setup = OmniSetupOverrides.model_validate({
+            "checkpoint_path": args.checkpoint_path,
+            "checkpoint_type": CheckpointType.DCP,
+            "experiment": args.experiment,
+            "experiment_overrides": [
+                "model.config.tokenizer.vae_path=/scratch/tarunrav/cosmos-framework/"
+                "examples/checkpoints/wan22_vae/Wan2.2_VAE.pth",
+            ],
+            "output_dir": "/tmp/velocity_eval_out",
+            "guardrails": False,
+            "use_ema_weights": False,
+        })
+        pipe = OmniInference.create(setup.build_setup())
+        model = pipe.model
+    model.eval()
+
+    for root in roots:
+        _eval_one(root, model, args)
+
+
+def _eval_one(dataset_root, model, args):
+    ds = RoboracerDataset(root=dataset_root, fps=15.0, chunk_length=32,
                           action_normalization="minmax", mode="wam")
     sft_ds = get_action_roboracer_sft_dataset(
-        root=args.dataset_root, fps=15.0, chunk_length=32, mode="wam",
+        root=dataset_root, fps=15.0, chunk_length=32, mode="wam",
         action_normalization="minmax", use_image_augmentation=False,
         oversample_turns=False, resolution="256", max_action_dim=64,
         cfg_dropout_rate=0.0,
     )
     idxs = stratified_by_velocity(ds, args.num_samples)
-    print(f"[{args.label}] {args.dataset_root.split('/')[-1]}: {len(idxs)} velocity-stratified samples "
+    print(f"[{args.label}] {dataset_root.split('/')[-1]}: {len(idxs)} velocity-stratified samples "
           f"from {len(ds)} windows", flush=True)
-
-    setup = OmniSetupOverrides.model_validate({
-        "checkpoint_path": args.checkpoint_path,
-        "checkpoint_type": CheckpointType.DCP,
-        "experiment": args.experiment,
-        "experiment_overrides": [
-            "model.config.tokenizer.vae_path=/scratch/tarunrav/cosmos-framework/"
-            "examples/checkpoints/wan22_vae/Wan2.2_VAE.pth",
-        ],
-        "output_dir": "/tmp/velocity_eval_out",
-        "guardrails": False,
-        "use_ema_weights": False,
-    })
-    pipe = OmniInference.create(setup.build_setup())
-    model = pipe.model
-    model.eval()
 
     stats_raw = load_action_stats(str(_STATS_PATH))
     stats = {k: torch.from_numpy(v).float() for k, v in stats_raw.items()}
@@ -173,7 +197,7 @@ def main():
     fast = [preds[i] for i, g in enumerate(gts) if g > mid]
 
     print()
-    print(f"=== [{args.label}] VELOCITY (pos_x), n={len(gts)} ===")
+    print(f"=== [{args.label}] {dataset_root.split(chr(47))[-1]} VELOCITY (pos_x), n={len(gts)} ===")
     print(f"  GT   range [{lo:.4f}, {hi:.4f}]  spread {hi-lo:.4f}")
     print(f"  PRED range [{min(preds):.4f}, {max(preds):.4f}]  spread {max(preds)-min(preds):.4f}")
     print(f"  Pearson r  = {pearson(gts,preds):+.3f}")

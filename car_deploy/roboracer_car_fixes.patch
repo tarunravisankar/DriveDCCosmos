@@ -1,0 +1,125 @@
+From 1ddeba9b2e91a1ed158896817c4235b0c15fb4bf Mon Sep 17 00:00:00 2001
+From: Tarun Ravisankar <tarun.vidyut@gmail.com>
+Date: Fri, 14 Aug 2026 12:17:14 -0500
+Subject: [PATCH 1/2] Fix curvature blow-up that pinned the steering servo to
+ full lock
+
+to_curvature_velocity divided yaw_delta by an arc_length floored at 1e-3 m.
+Near-stationary steps are in-distribution (q01 of dx is exactly 0.0, from the
+wait dataset's stopped frames), so any yaw noise on such a step was amplified
+~1000x: 0.003 rad over a 1e-3 m arc reads as 3.0 1/m.
+
+On the car this saturated the client's clamp on steps 2-32 of every chunk.
+Inverting car.lua's servo mapping (offset 0.5585, gain -0.9507) from the logged
+servo value of 1.2917 gives a steering angle of -0.771 rad against a
+max_steering_angle of 0.403 -- i.e. full lock right, continuously, which is what
+drove the car into a wall. Only the first step of each chunk was logged, and
+that one is healthy (-0.056 1/m), which is why the logs looked benign.
+
+A stationary car is not turning, so report zero curvature below a 1cm/step
+threshold instead of dividing it out. Normal driving steps are unchanged.
+
+Note this does not affect the reported eval numbers: velocity_eval.py works on
+raw action dims and never calls this conversion.
+---
+ .../scripts/action_policy_server_roboracer.py     | 15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/cosmos_framework/scripts/action_policy_server_roboracer.py b/cosmos_framework/scripts/action_policy_server_roboracer.py
+index bd9e161..b44b438 100644
+--- a/cosmos_framework/scripts/action_policy_server_roboracer.py
++++ b/cosmos_framework/scripts/action_policy_server_roboracer.py
+@@ -74,6 +74,10 @@ from cosmos_framework.scripts.action_policy_server_utils import maybe_init_distr
+ from cosmos_framework.utils import log
+ 
+ _CHUNK_LENGTH = 32
++# Minimum per-step arc length (metres) below which the car counts as stopped and
++# curvature is reported as zero rather than divided out. 1cm/step at 15fps is
++# 0.15 m/s -- well under the corpus mean step of 0.061 m (~0.92 m/s).
++_MIN_ARC_M = 1e-2
+ _RESOLUTION = "256"
+ _MAX_ACTION_DIM = 64
+ 
+@@ -113,9 +117,16 @@ def to_curvature_velocity(actions_raw: np.ndarray, fps: float = 15.0) -> tuple[n
+     dx = actions_np[:, 0]
+     rot_0, rot_1 = actions_np[:, 3], actions_np[:, 4]
+     yaw_delta = np.arctan2(rot_1, rot_0)
+-    arc_length = np.maximum(np.sqrt(actions_np[:, 0] ** 2 + actions_np[:, 1] ** 2), 1e-3)
++    arc_length = np.sqrt(actions_np[:, 0] ** 2 + actions_np[:, 1] ** 2)
+     velocity = dx / dt
+-    curvature = yaw_delta / arc_length
++    # Curvature = yaw per unit distance travelled, so it is undefined for a
++    # stationary step -- and near-stationary steps are common and in-distribution
++    # (q01 of dx is exactly 0.0, from the `wait` dataset's stopped frames).
++    # Dividing by a floored arc_length turned those into enormous curvatures:
++    # a 0.003 rad yaw delta over a 1e-3 m arc reads as 3.0 1/m, which saturated
++    # the client's clamp and pinned the steering servo to full lock. A car that
++    # is not moving is not turning, so report zero curvature there instead.
++    curvature = np.where(arc_length > _MIN_ARC_M, yaw_delta / np.maximum(arc_length, _MIN_ARC_M), 0.0)
+     return curvature, velocity
+ 
+ 
+-- 
+2.34.1
+
+
+From a903a40b7eb766dc0680ce362904b7a0fe7fd563 Mon Sep 17 00:00:00 2001
+From: Tarun Ravisankar <tarun.vidyut@gmail.com>
+Date: Fri, 14 Aug 2026 12:40:05 -0500
+Subject: [PATCH 2/2] Solve UniPC's tiny corrector systems on CPU so
+ num_steps>1 works on Jetson
+
+UniPC raises its solver order as sampling proceeds. At order >= 2 the corrector
+(and at order >= 3 the predictor) calls torch.linalg.solve. On Jetson JP6 that
+crashes:
+
+  libtorch_cuda_linalg.so: undefined symbol: cusolverDnXsyevBatched_bufferSize
+
+so any num_steps > 1 died at sampling step 3, which is why the car was pinned to
+num_steps=1 -- a single Euler step of the flow-matching ODE, which lands near
+the conditional mean and flattens the action distribution.
+
+The matrices are [order,order], i.e. 2x2 at the default solver_order=2, so
+cuSOLVER is pure overhead even where it works. Solving on CPU and moving the
+result straight back to the original device is numerically identical: verified
+on x86 against the cuSOLVER path, where first-step velocities across five
+direction tokens matched exactly (+0.12/+0.06/+0.10/+0.23/+0.26 m/s).
+---
+ .../diffusion/samplers/fm_solvers_unipc.py         | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/cosmos_framework/model/generator/diffusion/samplers/fm_solvers_unipc.py b/cosmos_framework/model/generator/diffusion/samplers/fm_solvers_unipc.py
+index 5fefbc4..ca77a1b 100644
+--- a/cosmos_framework/model/generator/diffusion/samplers/fm_solvers_unipc.py
++++ b/cosmos_framework/model/generator/diffusion/samplers/fm_solvers_unipc.py
+@@ -442,7 +442,14 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
+             if order == 2:
+                 rhos_p = torch.tensor([0.5], dtype=x.dtype, device=device)  # [1]
+             else:
+-                rhos_p = torch.linalg.solve(R[:-1, :-1], b[:-1]).to(device).to(x.dtype)  # [order-1]
++                # Solve on CPU: R is [order-1,order-1] (order <= solver_order, so
++                # 2x2 at most), for which cuSOLVER is pure overhead -- and on
++                # Jetson it is unavailable outright, since the aarch64 torch build
++                # ships a libtorch_cuda_linalg.so linked against a mismatched
++                # libcusolver ("undefined symbol: cusolverDnXsyevBatched_bufferSize").
++                # That crash is what forced num_steps=1 on the car. Result is moved
++                # back to `device` immediately, so behaviour is unchanged.
++                rhos_p = torch.linalg.solve(R[:-1, :-1].cpu(), b[:-1].cpu()).to(device).to(x.dtype)  # [order-1]
+         else:
+             D1s = None
+ 
+@@ -580,7 +587,10 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
+         if order == 1:
+             rhos_c = torch.tensor([0.5], dtype=x.dtype, device=device)  # [1]
+         else:
+-            rhos_c = torch.linalg.solve(R, b).to(device).to(x.dtype)  # [order]
++            # Solve on CPU -- see the matching note in multistep_uni_p_bh_update.
++            # This is the call the corrector hits at order >= 2, i.e. the one that
++            # made any num_steps > 1 fail on Jetson.
++            rhos_c = torch.linalg.solve(R.cpu(), b.cpu()).to(device).to(x.dtype)  # [order]
+ 
+         if self.predict_x0:
+             x_t_ = sigma_t / sigma_s0 * x - alpha_t * h_phi_1 * m0  # [B,C,T,H,W]
+-- 
+2.34.1
+
