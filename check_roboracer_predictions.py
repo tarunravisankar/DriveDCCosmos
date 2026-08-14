@@ -127,9 +127,16 @@ def to_curvature_velocity(actions_raw, fps: float = 15.0) -> tuple[np.ndarray, n
     dx, dy = actions_np[:, 0], actions_np[:, 1]
     rot_0, rot_1 = actions_np[:, 3], actions_np[:, 4]
     yaw_delta = np.arctan2(rot_1, rot_0)
-    arc_length = np.maximum(np.sqrt(dx**2 + dy**2), 1e-3)
+    # Curvature is yaw per unit distance travelled, so it is undefined for a
+    # stationary step -- and near-stationary steps are in-distribution (q01 of dx
+    # is exactly 0.0, from the `wait` dataset). Flooring arc_length turned those
+    # into huge curvatures (0.003 rad over 1e-3 m reads as 3.0 1/m), which
+    # saturated the client clamp and pinned the steering servo to full lock.
+    _MIN_ARC_M = 1e-2
+    arc_length = np.sqrt(dx**2 + dy**2)
     velocity = dx / dt
-    curvature = yaw_delta / arc_length
+    curvature = np.where(arc_length > _MIN_ARC_M,
+                         yaw_delta / np.maximum(arc_length, _MIN_ARC_M), 0.0)
     return curvature, velocity
 
 
