@@ -442,7 +442,14 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
             if order == 2:
                 rhos_p = torch.tensor([0.5], dtype=x.dtype, device=device)  # [1]
             else:
-                rhos_p = torch.linalg.solve(R[:-1, :-1], b[:-1]).to(device).to(x.dtype)  # [order-1]
+                # Solve on CPU: R is [order-1,order-1] (order <= solver_order, so
+                # 2x2 at most), for which cuSOLVER is pure overhead -- and on
+                # Jetson it is unavailable outright, since the aarch64 torch build
+                # ships a libtorch_cuda_linalg.so linked against a mismatched
+                # libcusolver ("undefined symbol: cusolverDnXsyevBatched_bufferSize").
+                # That crash is what forced num_steps=1 on the car. Result is moved
+                # back to `device` immediately, so behaviour is unchanged.
+                rhos_p = torch.linalg.solve(R[:-1, :-1].cpu(), b[:-1].cpu()).to(device).to(x.dtype)  # [order-1]
         else:
             D1s = None
 
@@ -580,7 +587,10 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         if order == 1:
             rhos_c = torch.tensor([0.5], dtype=x.dtype, device=device)  # [1]
         else:
-            rhos_c = torch.linalg.solve(R, b).to(device).to(x.dtype)  # [order]
+            # Solve on CPU -- see the matching note in multistep_uni_p_bh_update.
+            # This is the call the corrector hits at order >= 2, i.e. the one that
+            # made any num_steps > 1 fail on Jetson.
+            rhos_c = torch.linalg.solve(R.cpu(), b.cpu()).to(device).to(x.dtype)  # [order]
 
         if self.predict_x0:
             x_t_ = sigma_t / sigma_s0 * x - alpha_t * h_phi_1 * m0  # [B,C,T,H,W]
