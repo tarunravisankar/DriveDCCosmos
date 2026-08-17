@@ -211,8 +211,12 @@ VPN mesh, different host. Use the one your server is actually on.)
 
 ### 4.2 Get the client into the container
 
-Don't assume the scripts are already there — a different physical car won't have
-them. Source of truth is robolang:
+**orin10 is already up to date** — it has the current client with all fixes, at
+`/home/orin/roboracer_ws/roboracer_chunk_buffered_client.py`. Skip to 4.3.
+
+For a *different* car, don't assume the scripts are there. Source of truth is
+robolang (or `car_deploy/` on this branch, which also carries the framework
+patch):
 
 ```bash
 # from anywhere that can reach both robolang and the car
@@ -232,6 +236,17 @@ docker exec orin_roboracer bash -lc 'python3 -c "import websockets, msgpack" || 
 cd ~/roboracer_ws/tmux/navstack/ && tmuxinator
 ```
 
+This brings up the camera, VESC, joystick and `/odom`. Starting `/odom` is only
+safe because `--subgoal-lookahead-s` now defaults to **0**: the training data has
+no goal dots (`convert_all_datasets.sh` sets `LOOKAHEAD=0`), but the client used
+to default to 5.0 and would begin drawing dots the model has never seen the
+moment odometry appeared.
+
+> **Do not use the `cosmos` tmuxinator profile for tethered runs.** It starts an
+> *on-car* server, points the client at `127.0.0.1`, and — unlike the standalone
+> client — **defaults to LIVE**. `LIVE=0` is the opt-out there. Run the client by
+> hand as in 4.4 instead.
+
 ### 4.4 Dry-run first — always
 
 `--dry-run` is the default. The client subscribes to the camera, calls the
@@ -239,12 +254,22 @@ server at 15 Hz, and **logs** predictions without ever constructing an
 `AckermannCurvatureDriveMsg`.
 
 ```bash
-docker exec -it orin_roboracer bash -l
-python3 /tmp/roboracer_chunk_buffered_client.py --server-ip 10.0.0.212 --server-port 18767
+cd ~/roboracer_ws && ./container shell          # or: docker exec -it orin_roboracer bash -l
+python3 /home/orin/roboracer_ws/roboracer_chunk_buffered_client.py \
+  --server-ip 10.0.0.212 --server-port 18767 --direction pass_right
 ```
 
 Watch the logged curvature/velocity against what the car is actually looking at.
 Do not proceed if the numbers look constant, clamped, or NaN.
+
+**Walk in front of the camera and confirm the numbers move.** A stationary car
+looking at a static scene produces near-constant output even from a healthy
+model, so "constant" is only meaningful once the scene changes.
+
+Expect behaviour to differ by token, and only on the axis that token cares about
+(numbers in §7): `pass_right` steers strongly, `wait` slows but **under-brakes**
+(~29% of the demonstrated slowdown — use a box, not a person), `pass_left` is
+weak, and the navigation loops hold a roughly constant speed.
 
 ### 4.5 Go live
 
@@ -259,8 +284,12 @@ Three independent safety layers, all already in place:
 2. The car's `vesc_driver` **ignores the topic entirely** unless a human has
    enabled autonomous mode on the joystick, and any joystick input past a
    deadzone instantly overrides per-axis.
-3. `--max-velocity` (default 1.0 m/s) and `--max-curvature` (default 3.0 1/m)
-   hard-clamp every published command.
+3. `--max-velocity` (default 1.0 m/s) and `--max-curvature` (default **1.3** 1/m)
+   hard-clamp every published command. 1.3 is the car's *physical* steering
+   limit: `car.lua` sets `max_steering_angle=0.4030`, so
+   `tan(0.4030)/wheelbase(0.32) = 1.33` 1/m. The previous default of 3.0 was
+   above anything the servo could execute, so the clamp bounded nothing — it
+   just handed `vesc_driver` a value that saturated the steering at full lock.
 
 There is also a **fail-safe STOP**: if the chunk buffer empties or goes older
 than `--max-buffer-age-s` (default 3 s) — server unreachable, one inference
