@@ -15,9 +15,9 @@ untouched and still serves the old model.
 > — a patch file plus the client, with the four fixes that stopped the car
 > driving into a wall. **orin10 already has all of them applied.**
 >
-> **Use the tethered path (§4).** On-car standalone inference loads and runs but
-> currently produces near-constant output that ignores the camera — see
-> "Known-broken: on-Jetson inference" in §7.
+> **On-car inference now works** — two bugs (uninitialised meta-init buffers, and
+> a 1-frame video window) are fixed; see §7. The tethered path (§4) is still the
+> better *control* loop: ~0.23 s per call versus ~1.55 s on-board.
 
 ---
 
@@ -512,27 +512,43 @@ validation had not improved for 4,400 iterations, so more training of this recip
 is unlikely to help. The remaining hypothesis is capacity (Edge runs a 2B-active
 text backbone vs Nano's 8B).
 
-### Known-broken: on-Jetson inference
+### On-Jetson inference: fixed (was ignoring the camera)
 
-Every number above is from **x86**. On the Jetson the same checkpoint produces
-near-constant output that is independent of both the camera image and the
-direction token:
+On-car inference previously emitted a near-constant action regardless of what the
+camera saw. **Two bugs, both fixed** — see
+[`car_deploy/README.md`](../car_deploy/README.md) for the patches:
 
-| | Jetson | x86, identical checkpoint |
-|---|---|---|
-| curvature spread across 5 direction tokens | 0.008 | **1.614** |
-| curvature spread across 4 different frames | 0.006 | **1.105** |
-| first-step velocity | +4.15 (corpus max ≈3.0) | +0.06…+0.26 |
+1. **Uninitialised non-persistent buffers after meta-device init.** `COSMOS_KEEP_META_INIT=1`
+   builds the net on meta so INT4 weights fit unified memory; materialisation
+   allocates uninitialised storage, and `persistent=False` buffers are absent from
+   the checkpoint so nothing restores them. `time_embedder._timestep_frequencies`
+   held `sum=+3.26e24` instead of `+14.401979`, so the model could not tell where
+   it was on the denoising trajectory. **This was the primary cause.**
+2. **The live video window was truncated to 1 frame** instead of 33, which cut the
+   generation sequence from 752 tokens to 112.
 
-Ruled out by measurement, not argument: INT4 quantization (bf16 and INT4 agree
-closely on x86); the UniPC CPU-solve fix (x86 velocities identical to the
-cuSOLVER path); SDPA dropping varlen boundaries (instrumented — 0 of 600+ calls
-passed any); causal mask top-left vs bottom-right (all causal calls are square);
-preprocessing config drift (configs byte-identical); corrupt transfer
-(`model.safetensors` md5 matches). The cause is somewhere in the Jetson
-numerical stack and is not yet localised.
+After both fixes, on-car output matches x86 in structure:
 
-**Use the tethered path (§4) until this is resolved.**
+| | before | after | x86 |
+|---|---|---|---|
+| velocity across 4 frames | +4.19 flat | **0.27 → 1.00 → 1.09 → 1.12** | 0.12 → 1.01 → 1.09 |
+| curvature spread, frames | 0.005 | **0.446** | — |
+| curvature spread, captions | 0.008 | **0.297** | — |
+
+The caption ordering matches x86 exactly
+(`loop_cw < wait < loop_ccw < pass_left < pass_right`), and peak device memory is
+**2.47 GB** on the Orin Nano.
+
+Ruled out along the way, each by measurement rather than argument: INT4
+quantization, bitsandbytes on `sm_87` (dequantized weights bit-identical), the
+SDPA attention fallback (forced on x86 for all 56 calls — correct output), CUDA
+RNG (bit-identical), tokenization (identical IDs), and the VAE (identical latents
+that track the input). `named_parameters()` looked healthy the whole time — only
+the buffers were wrong.
+
+**Still open:** on-car inference runs at ~1.55 s per call versus ~0.23 s tethered,
+so the tether gives roughly 6x tighter closed-loop control. Measure again with
+`sudo jetson_clocks` pinned before choosing.
 
 ---
 

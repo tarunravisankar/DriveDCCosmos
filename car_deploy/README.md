@@ -16,6 +16,60 @@ car, a re-image, or reproducing the state from scratch.
 | Goal-dot default | `roboracer_chunk_buffered_client.py` | `--subgoal-lookahead-s` defaulted to **5.0**, but `convert_all_datasets.sh` sets `LOOKAHEAD=0`, so the checkpoints were trained on frames with **no goal dot**. The client would have started drawing dots the model has never seen the moment `/odom` came alive. Now defaults to 0, with a guard that makes 0 actually mean "no dot" (it previously still drew a degenerate bottom-centre dot). |
 | Curvature clamp | `roboracer_chunk_buffered_client.py` | `--max-curvature` was 3.0. `car.lua` has `max_steering_angle=0.4030`, so `tan(0.4030)/0.32 = 1.33 1/m` is the physical limit — the old clamp bounded nothing. Now 1.3. |
 
+## Critical: rebuild non-persistent buffers after a meta-device load
+
+**This was the bug that made on-car inference ignore the camera entirely.**
+
+`run_roboracer_server.sh` sets `COSMOS_KEEP_META_INIT=1` so the network is built
+on the meta device and the INT4 weights fit unified memory. Materialisation then
+allocates *uninitialised* storage — and buffers registered `persistent=False` are
+not in the checkpoint, so `load_state_dict` never fills them. They also get cast
+to the model precision instead of staying float32.
+
+Measured on orin10 before the fix:
+
+| buffer | expected | actual |
+|---|---|---|
+| `time_embedder._timestep_frequencies` | float32, sum `+14.401979`, all in (0,1] | **bfloat16, sum `+3.26e24`, min `-1.07e8`** |
+| `rotary_emb.original_inv_freq` | float32 | **bfloat16, sum `+4.6e35`** |
+
+`_timestep_frequencies` is the sinusoidal frequency table for the diffusion
+timestep embedding. With garbage frequencies the model cannot tell where it is on
+the denoising trajectory, and its output decouples from both the image and the
+caption — the "same action no matter what the camera sees" symptom.
+
+Insert immediately after `self.model = hf_model.model`:
+
+```python
+n_fixed = 0
+for _mod in self.model.modules():
+    if type(_mod).__name__ == "TimestepEmbedder" and hasattr(_mod, "_timestep_frequencies"):
+        _dev = _mod._timestep_frequencies.device
+        _f = _mod._build_timestep_frequencies(
+            _mod.frequency_embedding_size, max_period=10000, device=_dev)
+        _mod.register_buffer("_timestep_frequencies", _f, persistent=False)
+        n_fixed += 1
+    _inv = getattr(_mod, "inv_freq", None)
+    _orig_inv = getattr(_mod, "original_inv_freq", None)
+    if _inv is not None and _orig_inv is not None and (
+        _orig_inv.dtype != _inv.dtype or _orig_inv.shape != _inv.shape
+        or not torch.isfinite(_orig_inv).all()
+        or bool((_orig_inv.float() - _inv.float()).abs().max() > 1e-3)
+    ):
+        _mod.original_inv_freq = _inv.detach().clone()
+        n_fixed += 1
+if n_fixed:
+    log.info(f"[roboracer-policy-server] rebuilt {n_fixed} non-persistent buffer(s) after meta init")
+```
+
+Verify on startup: the log must show `rebuilt 2 non-persistent buffer(s)`, and
+`_timestep_frequencies` must read `sum=+14.401979`, first values
+`[1.0, 0.930572, 0.865964, …]`.
+
+**Any meta-device init path needs this audit** — `named_parameters()` looked
+perfectly healthy throughout (549 params, 0 on meta, 0 NaN). Only the buffers
+were wrong.
+
 ## Also check: the WAM video window must be 33 frames
 
 orin10's server had `_build_live_sample` truncated to a single frame:
