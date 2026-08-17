@@ -110,6 +110,9 @@ def main():
     p.add_argument("--num-steps", type=int, default=4)
     p.add_argument("--shift", type=float, default=5.0)
     p.add_argument("--label", default="model")
+    p.add_argument("--vae-path",
+                   default="/scratch/tarunrav/cosmos-framework/examples/checkpoints/wan22_vae/Wan2.2_VAE_fp16.pth",
+                   help="fp16 Wan VAE; on the car this is /home/orin/Wan2.2_VAE_fp16.pth")
     args = p.parse_args()
 
     roots = [r for r in (s.strip() for s in args.dataset_root.split(",")) if r]
@@ -121,12 +124,45 @@ def main():
     checkpoint_type = CheckpointType.from_path(Path(args.checkpoint_path))
     print(f"[{args.label}] checkpoint type: {checkpoint_type}", flush=True)
     if checkpoint_type == CheckpointType.HF:
-        from cosmos_framework.inference.model import Cosmos3OmniModel
+        # Reuse the server's loader rather than calling from_pretrained directly.
+        # It carries the platform-specific setup an HF/INT4 checkpoint needs --
+        # pointing the VLM processor at the checkpoint's bundled tokenizer files
+        # (so edge serving stays offline instead of shelling out to `uv` to fetch
+        # nvidia/Cosmos3-Edge), deferring the vision tokenizer so INT4 weights
+        # load alone, then attaching the encode-only VAE. It also means this
+        # script measures exactly the configuration that gets deployed.
+        from cosmos_framework.scripts.action_policy_server_roboracer import RoboracerPolicyService
 
-        hf_model = Cosmos3OmniModel.from_pretrained(
-            args.checkpoint_path, device_map={"": 0}, dtype=torch.bfloat16,
+        _svc = RoboracerPolicyService(
+            checkpoint_path=args.checkpoint_path, eval_root=roots[0], vae_path=args.vae_path,
         )
-        model = hf_model.model
+        model = _svc.model
+        # Meta-device init (COSMOS_KEEP_META_INIT=1, used on Jetson so the INT4
+        # weights fit unified memory) leaves persistent=False buffers holding
+        # uninitialised storage -- they are not in the checkpoint, so nothing
+        # restores them. time_embedder._timestep_frequencies read sum=+3.26e24
+        # instead of +14.401979 on the car, which decouples the model's output
+        # from its input entirely. Same rebuild as
+        # action_policy_server_roboracer.py; a no-op off the meta path.
+        _nfix = 0
+        for _mod in model.modules():
+            if type(_mod).__name__ == "TimestepEmbedder" and hasattr(_mod, "_timestep_frequencies"):
+                _f = _mod._build_timestep_frequencies(
+                    _mod.frequency_embedding_size, max_period=10000,
+                    device=_mod._timestep_frequencies.device,
+                )
+                _mod.register_buffer("_timestep_frequencies", _f, persistent=False)
+                _nfix += 1
+            _inv = getattr(_mod, "inv_freq", None)
+            _oinv = getattr(_mod, "original_inv_freq", None)
+            if _inv is not None and _oinv is not None and (
+                _oinv.dtype != _inv.dtype or _oinv.shape != _inv.shape
+                or not torch.isfinite(_oinv).all()
+                or bool((_oinv.float() - _inv.float()).abs().max() > 1e-3)
+            ):
+                _mod.original_inv_freq = _inv.detach().clone()
+                _nfix += 1
+        print(f"[{args.label}] rebuilt {_nfix} non-persistent buffer(s)", flush=True)
     else:
         setup = OmniSetupOverrides.model_validate({
             "checkpoint_path": args.checkpoint_path,

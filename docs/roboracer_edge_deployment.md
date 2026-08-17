@@ -539,6 +539,28 @@ The caption ordering matches x86 exactly
 (`loop_cw < wait < loop_ccw < pass_left < pass_right`), and peak device memory is
 **2.47 GB** on the Orin Nano.
 
+Re-run of the full velocity-stratified eval **on the Orin itself** (n=48 per
+split, driven through the deployed websocket path — single camera frame plus
+direction token, not an in-process model):
+
+| split | velocity ρ (x86 INT4) | velocity ρ (**onboard**) | MAE x86 → onboard |
+|---|---|---|---|
+| `wait` | +0.502 | **+0.484** | 0.0250 → 0.0256 |
+| `pass_right` | +0.152 | +0.209 | 0.0255 → 0.0256 |
+| `pass_left` | +0.155 | +0.115 | 0.0260 → 0.0259 |
+| orin10 | −0.056 | −0.008 | 0.0459 → 0.0461 |
+
+Steering on-car reads +0.739 (`pass_right`) and +0.311 (`pass_left`). Note the
+steering column is **not** directly comparable across the two harnesses:
+`velocity_eval.py` correlates raw yaw angle, while `ws_eval.py` correlates
+curvature, which divides by arc length and zeroes below the stopped threshold.
+Velocity is the same quantity in both and matches closely.
+
+**Known gap:** `velocity_eval.py` cannot run in-process on the car — the
+bundled-processor shortcut does not trigger through that path, so it falls back
+to an `hf download` of `nvidia/Cosmos3-Edge` via `uv`, which is not installed on
+the Jetson. Use `ws_eval.py` against a running server instead.
+
 Ruled out along the way, each by measurement rather than argument: INT4
 quantization, bitsandbytes on `sm_87` (dequantized weights bit-identical), the
 SDPA attention fallback (forced on x86 for all 56 calls — correct output), CUDA
