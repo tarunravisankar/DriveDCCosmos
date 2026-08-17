@@ -16,6 +16,27 @@ car, a re-image, or reproducing the state from scratch.
 | Goal-dot default | `roboracer_chunk_buffered_client.py` | `--subgoal-lookahead-s` defaulted to **5.0**, but `convert_all_datasets.sh` sets `LOOKAHEAD=0`, so the checkpoints were trained on frames with **no goal dot**. The client would have started drawing dots the model has never seen the moment `/odom` came alive. Now defaults to 0, with a guard that makes 0 actually mean "no dot" (it previously still drew a degenerate bottom-centre dot). |
 | Curvature clamp | `roboracer_chunk_buffered_client.py` | `--max-curvature` was 3.0. `car.lua` has `max_steering_angle=0.4030`, so `tan(0.4030)/0.32 = 1.33 1/m` is the physical limit — the old clamp bounded nothing. Now 1.3. |
 
+## Also check: the WAM video window must be 33 frames
+
+orin10's server had `_build_live_sample` truncated to a single frame:
+
+```python
+# Live WAM: one conditioning frame only. Repeating chunk_length+1 identical
+# frames blew Jetson activation memory (attn seq~99) with no extra signal.
+video = frame.unsqueeze(0)                                    # WRONG
+video = frame.unsqueeze(0).repeat(_CHUNK_LENGTH + 1, 1, 1, 1) # correct
+```
+
+"No extra signal" is wrong. In `wam` mode only index 0 is *conditioning*; frames
+1..T-1 are the denoising targets the 32 action steps are jointly denoised with,
+and `build_sequence_plan_from_mode` derives the plan from `video.shape[1]`. With
+T=1 the model runs in a regime it never saw during training, and the caption's
+embedded duration degrades to "The video is 0.0 seconds long".
+
+The memory rationale was also unfounded: restoring 33 frames raised peak device
+memory from 2.47 GB to **2.67 GB**. This branch's copy is already correct — check
+any car whose tree came from elsewhere.
+
 ## Apply
 
 ```bash
