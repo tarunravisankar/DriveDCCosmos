@@ -1,74 +1,62 @@
 # Adapting Cosmos 3 to a new robot
 
-Cosmos 3 ships a post-training stack built for **robot arms** (DROID, LIBERO).
-This walks through what it takes to point it at something else — in this case a
-1/10-scale car — marking at each step **what the framework gives you** and **what
-you have to write yourself**.
+Cosmos 3 ships post-training recipes for robot arms (DROID, LIBERO). This
+describes what it took to point it at a 1/10-scale car, and marks which steps the
+framework handles and which you write yourself.
 
-Assumes no prior experience with Cosmos 3. Covers training only; serving and
-on-vehicle deployment are in
+Written for someone who hasn't used Cosmos 3. Covers training only. For serving
+and on-vehicle deployment see
 [`roboracer_int4_deployment.md`](./roboracer_int4_deployment.md).
 
 ---
 
-## First: five Cosmos 3 concepts
+## Concepts
 
-You need these to read anything else in the repo.
+**Experiment** — a Python file under `cosmos_framework/configs/base/experiment/`
+that registers a named configuration: datasets, which parameters train, losses,
+schedules. You refer to it by name (`action_policy_roboracer_nano`). The recipe
+lives here.
 
-**Experiment.** A Python file registering a named configuration — datasets, what
-trains, losses, schedules. Lives under
-`cosmos_framework/configs/base/experiment/…`. You refer to it by name
-(`action_policy_roboracer_nano`), never by path. This is where the real recipe
-lives.
+**TOML** — a file under `examples/toml/sft_config/` that picks an experiment and
+sets run-level scalars: precision, GPU count, checkpoint frequency. A strict
+schema rejects unknown keys before training starts.
 
-**TOML.** A small run-level file under `examples/toml/sft_config/`. Picks which
-experiment to run and sets a handful of scalars — precision, how many GPUs to
-shard across, how often to checkpoint. It is validated against a strict schema,
-so a typo fails immediately rather than silently.
+**Config precedence** — `CLI overrides > TOML > experiment .py`. Arguments after
+`--` on the launch command win. If a value in the `.py` doesn't match what you
+see at runtime, read the launch command.
 
-**Three config layers, and which wins.** This trips up everyone:
+**DCP** — PyTorch's distributed checkpoint format, a directory of `*.distcp`
+shards. Training reads and writes DCP. Serving uses HF safetensors, which you
+produce by exporting.
 
-```
-CLI overrides  >  TOML  >  experiment .py
-```
-
-Trailing arguments after `--` on the launch command beat everything. If a number
-in the `.py` doesn't match what you observe at runtime, check the launch command
-before assuming the code is wrong.
-
-**DCP.** *Distributed checkpoint* — PyTorch's sharded format, a directory of
-`*.distcp` files rather than one big file. Training reads and writes DCP. The
-separate HF (safetensors) format is what you export to for serving.
-
-**The two towers.** Cosmos 3 runs a *reasoner* (vision-language: reads the image
-and the instruction) and a *generator* (produces future video and actions). They
-are joined by cross-attention. Which parts of which tower get trained is the
-single most important thing the experiment file decides.
+**Two towers** — a reasoner (vision-language: reads the image and instruction)
+and a generator (produces future video and actions), joined by cross-attention.
+The experiment file decides which parts of which tower train.
 
 ---
 
-## The path at a glance
+## Steps
 
 | # | Step | Framework provides | You provide |
 |---|---|---|---|
 | 1 | Environment | `docs/setup.md` | — |
-| 2 | **Dataset** | *nothing — explicitly out of scope* | **`convert_roboracer_to_lerobot.py`** |
+| 2 | Dataset | nothing | `convert_roboracer_to_lerobot.py` |
 | 3 | Base checkpoint | `convert_model_to_dcp` | — |
-| 4 | Recipe | DROID experiment as a template | **your experiment file** |
-| 5 | Launch | `cosmos_framework.scripts.train` | **`train_supervisor.py`** |
+| 4 | Recipe | DROID experiment as template | your experiment file |
+| 5 | Launch | `cosmos_framework.scripts.train` | `train_supervisor.py` |
 | 6 | Export | `export_model.py` | — |
 
-**Step 2 has no framework equivalent at all.** That is where most of the work is.
+Step 2 is most of the work.
 
 ---
 
-## 1 — Environment
+## 1. Environment
 
-Read [`docs/setup.md`](./setup.md), then
+Read [`docs/setup.md`](./setup.md) and
 [`docs/environment_variables.md`](./environment_variables.md).
 
-Keep package and model caches off your home directory — it usually has a quota
-and these caches will fill it:
+Point the caches at scratch space. They default to your home directory and will
+fill its quota.
 
 ```bash
 export UV_CACHE_DIR=/scratch/$USER/.cache/uv
@@ -77,70 +65,67 @@ export HF_HOME=/scratch/$USER/.cache/huggingface
 
 ---
 
-## 2 — Dataset: the step the framework leaves to you
+## 2. Dataset
 
-**Read first:** [`docs/action_policy_droid_posttrain.md`](./action_policy_droid_posttrain.md),
-the canonical action-policy recipe. Note what it says under *Inputs you provide*:
+Start with [`docs/action_policy_droid_posttrain.md`](./action_policy_droid_posttrain.md).
+Under *Inputs you provide* it says the LeRobot conversion is "run out-of-band
+(not yet in this repo)", and the Dataset section says "To be released."
 
-> "the LeRobot v2.0→v3.0 conversion + success filtering is **run out-of-band (not
-> yet in this repo)**"
+The framework expects a finished LeRobot v3.0 dataset and doesn't tell you how to
+build one.
 
-and under *Dataset*: **"To be released."**
-
-So the framework expects a finished dataset in **LeRobot v3.0** format and does
-not tell you how to build one. For a robot that isn't DROID, this is the bulk of
-the work.
-
-### What a LeRobot dataset looks like
+### Format
 
 ```
 my_dataset/
-├── meta/info.json              episode count, frame count, fps
-├── data/chunk-000/*.parquet    per-frame actions + indices
-└── videos/<camera>/chunk-000/*.mp4   H.264 (required by Cosmos)
+├── meta/info.json                     episode count, frame count, fps
+├── data/chunk-000/*.parquet           per-frame actions and indices
+└── videos/<camera>/chunk-000/*.mp4    H.264, required by Cosmos
 ```
 
-Each row pairs one video frame with the action taken at that moment.
+Each parquet row pairs one video frame with the action taken at that moment.
 
-### The worked example
+### Converting
 
-`convert_roboracer_to_lerobot.py` turns ROS 2 bags into exactly that. The parts
-worth copying:
+`convert_roboracer_to_lerobot.py` turns ROS 2 bags into this layout. Four parts
+generalize:
 
-| what | why it matters |
-|---|---|
-| `_resolve_topic_id()` | ROS assigns topic IDs per-bag by recording order. Hardcoding them reads the wrong stream, silently. |
-| `sync_odom_to_frames()` | Camera and odometry publish independently and never at the same instant. The camera is the clock; odometry snaps to the nearest one. |
-| `compute_actions()` | Converts absolute pose into **relative** pose deltas. Absolute position is useless as a target — it encodes where the track happens to sit in the room. |
-| 9-D `[pos_xyz, rot6d]` | Matches Cosmos 3's built-in `av` domain (`domain_id=1`). |
+`_resolve_topic_id()` looks up topic IDs by name per bag. ROS assigns them in
+recording order, so hardcoding reads the wrong stream without error.
 
-**Two decisions to copy rather than reinvent:**
+`sync_odom_to_frames()` matches each camera frame to the nearest odometry
+reading. The two publish independently and never align.
 
-**Use a domain the framework already knows.** Cosmos 3 has registered action
-spaces (`av` for vehicles, `joint_pos` for arms). Using one means the pretrained
-action pathway transfers. Inventing your own throws that away.
+`compute_actions()` converts absolute pose to relative pose deltas. Absolute
+position encodes where the track sits in the room, which the model can't use.
 
-**Represent rotation as rot6d, not an angle.** Angles wrap at ±π, so a model
-regressing across that boundary learns badly near it. rot6d is continuous.
+The 9-D `[pos_xyz, rot6d]` action matches Cosmos 3's `av` domain
+(`domain_id=1`).
 
-### Also needed
+Two choices to copy:
+
+Use a registered action space (`av` for vehicles, `joint_pos` for arms). The
+pretrained action pathway only transfers if the format matches.
+
+Represent rotation as rot6d rather than an angle. Angles wrap at ±π and
+regression breaks across the discontinuity.
+
+### Supporting scripts
 
 - `convert_all_datasets.sh` — one caption per recording campaign, all splits
-- `compute_roboracer_stats.py` — normalization statistics over the **full** corpus
-- `roboracer_bag_split_*.json` — pins which recordings go to train/eval/test
+- `compute_roboracer_stats.py` — normalization statistics over the full corpus
+- `roboracer_bag_split_*.json` — assigns recordings to train, eval, test
 
-> **Split by recording session, never by frame.** At 15 fps, consecutive frames
-> are 67 ms apart and nearly identical. A frame-level split puts near-duplicates
-> in both train and test, and your evaluation becomes meaningless.
+Split by recording session, not by frame. At 15 fps consecutive frames are 67 ms
+apart and nearly identical, so a frame-level split puts near-duplicates in both
+train and test.
 
-**Reference:** [`docs/custom_dataset.md`](./custom_dataset.md) §3 for how a
-dataset plugs into the dataloader, including mixing several by ratio.
+See [`docs/custom_dataset.md`](./custom_dataset.md) §3 for how datasets reach the
+dataloader, including mixing several by ratio.
 
 ---
 
-## 3 — Base checkpoint
-
-Convert the published model to DCP:
+## 3. Base checkpoint
 
 ```bash
 python -m cosmos_framework.scripts.convert_model_to_dcp \
@@ -148,112 +133,110 @@ python -m cosmos_framework.scripts.convert_model_to_dcp \
   -o examples/checkpoints/Cosmos3-Nano
 ```
 
-Verify it worked — the output must contain `model/*.distcp`:
+Check the output contains shards:
 
 ```bash
 ls examples/checkpoints/Cosmos3-Nano/model/ | head
 # __0_0.distcp  __0_1.distcp  __0_2.distcp ...
 ```
 
-**Prefer a `*-Policy-*` variant if one exists for your tier.** Those ship a
-trained generation expert and action bridges; the plain base model does not, and
-a cold-started action pathway is much harder to train.
+Use a `*-Policy-*` variant if one exists for your tier. Those ship a trained
+generation expert and action bridges. The plain base model doesn't, and a
+cold-started action pathway is harder to train.
 
 ---
 
-## 4 — The recipe
+## 4. Recipe
 
-**Read:** `docs/action_policy_droid_posttrain.md` §Recipe for the knob table, then
-[`docs/sft_config.md`](./sft_config.md) for what the TOML is allowed to set.
+Read `docs/action_policy_droid_posttrain.md` §Recipe for the knob table and
+[`docs/sft_config.md`](./sft_config.md) for the TOML schema.
 
-**Copy this template:**
+Template:
 `cosmos_framework/configs/base/experiment/action/posttrain_config/action_policy_droid_nano.py`
 
-**Compare against:** `…/action_policy_roboracer_nano.py`
+Compare against `action_policy_roboracer_nano.py`.
 
 ### Keep the framework's fine-tuning strategy
 
-The DROID experiment sets `keys_to_select`, which restricts the optimizer to a
-named list of parameter groups — the generation expert, the timestep embedder,
-and the modality bridges. **Everything else, including the entire vision-language
-reasoner, stays frozen.**
+The DROID experiment sets `keys_to_select`, restricting the optimizer to the
+generation expert, the timestep embedder, and the modality bridges. Everything
+else stays frozen, including the whole vision-language reasoner.
 
-The roboracer recipe uses this list unchanged, and you probably should too. The
-reasoning: a few hours of robot data cannot teach a model to see, and letting it
-try would overwrite pretrained perception. Freezing spends your data entirely on
-learning control.
+The roboracer recipe uses this list unchanged. A few hours of robot data can't
+teach a model to see, and training the reasoner would overwrite pretrained
+perception. Freezing it spends your data on control.
 
-Same for `keys_to_skip_loading` and the 5× `lr_multipliers` on the action
-bridges — the pretrained action heads encode the *source* robot's action space,
-so they get discarded and retrained faster than everything else.
+`keys_to_skip_loading` and the 5× `lr_multipliers` on the action bridges come
+from the same recipe. The pretrained action heads encode the source robot's
+action space, so they're discarded and retrained at a higher learning rate.
 
-### What you do change
+### What changes
 
-| knob | DROID | RoboRacer | why |
+| knob | DROID | RoboRacer | reason |
 |---|---|---|---|
 | action space | `joint_pos` 8-D | `av` 9-D | car, not arm |
 | `use_state` | true | false | no proprioception |
 | viewpoint | `concat_view` | single camera | one camera |
 | resolution | 480 | 256 | smaller images |
 | fps | 0 | 15 | matches the data |
-| normalization | `None` | `minmax` | see below |
-| **validation** | **disabled** | **enabled, deployable mode only** | see below |
+| normalization | `None` | `minmax` | — |
+| validation | disabled | enabled, deployable mode only | below |
 
-### The two additions that matter most
+### Validation
 
-**Validation.** The DROID recipe sets `run_validation=False` and `mode="disabled"`
-— and the doc says so explicitly under *Non-goals*: *"Closed-loop / action
-evaluation is out of scope."* It trains for a fixed number of steps and stops.
+DROID sets `run_validation=False` and `mode="disabled"`. Its doc lists
+closed-loop evaluation under *Non-goals*. The recipe trains for a fixed number of
+steps and stops.
 
-If you want to know when to stop, or which checkpoint to deploy, you have to add
-a validation signal yourself.
+To know when to stop, or which checkpoint to deploy, add validation yourself.
 
-**Train on a mixture, validate on what you can deploy.** Three modes exist:
+### Training mode
 
-| mode | given | predicts | deployable? |
+Three modes exist:
+
+| mode | input | output | deployable |
 |---|---|---|---|
 | `forward_dynamics` | frame + actions | future video | no |
-| `inverse_dynamics` | all video | the actions taken | **no** — needs the future |
-| `policy` / `wam` | one frame + instruction | video and actions | **yes** |
+| `inverse_dynamics` | all video | actions taken | no, needs the future |
+| `policy` / `wam` | one frame + instruction | video and actions | yes |
 
 Training only in the deployable mode collapsed to a near-constant straight-line
-action: the shared backbone must reconstruct video *and* predict actions from a
-single frame, and a constant minimizes loss on the straight-driving majority.
-Training on `mode="joint"` — a random mix of all three per sample — teaches the
-same physics through easier problems.
+action. The shared backbone has to reconstruct video and predict actions from one
+frame, and a constant minimizes loss on the straight-driving majority.
+`mode="joint"` mixes all three per sample and teaches the same dynamics through
+easier problems.
 
-But validation must stay in the deployable mode only. `inverse_dynamics` sees
-real future frames, so validating there reports performance the robot can never
-achieve, and early stopping would fire on a fiction.
+Validate in the deployable mode only. `inverse_dynamics` sees real future frames,
+so validating there reports performance the robot can't reach and early stopping
+fires on it.
 
 ### Two settings that fail silently
 
-**`loss_scale` weights only the video term.**
+`loss_scale` weights only the video term:
 
 ```
 total = fm_loss_vision * loss_scale + fm_loss_action * action_loss_weight
 ```
 
-Your model tier's base YAML may set `loss_scale=10.0`, tuned for manipulation.
-That makes the effective action:video ratio 1:1 instead of 10:1. **Training
-converges perfectly normally on the wrong objective.** The only symptom is a
-validation loss several times higher than expected. Re-check this on any tier
-change.
+Your tier's base YAML may set `loss_scale=10.0`, tuned for manipulation, making
+the effective action:video ratio 1:1 instead of 10:1. Training converges normally
+on the wrong objective. The only symptom is a validation loss several times
+higher than expected. Re-check this whenever you change model tier.
 
-**`model.config.resolution` is not the data resolution.** It is a lookup key into
-`shift = {"256": 3, "480": 5, "720": 10}` for the flow-matching schedule. The data
-resolution is set separately on the dataset. Changing this to match your images
-silently changes the sampler.
+`model.config.resolution` is not the data resolution. It's a key into
+`shift = {"256": 3, "480": 5, "720": 10}` for the flow-matching schedule. Data
+resolution is set on the dataset. Changing this to match your images changes the
+sampler instead.
 
 ---
 
-## 5 — Launch
+## 5. Launch
 
-**The framework's way** — see [`docs/training.md`](./training.md) — is a shell
-launcher, `examples/launch_sft_action_policy_droid.sh`. Fine for one clean run.
+[`docs/training.md`](./training.md) documents the shell launcher,
+`examples/launch_sft_action_policy_droid.sh`. It works for a single run.
 
-**What the roboracer runs used** is a supervisor that calls the trainer directly,
-so it can restart the job when it hangs:
+The roboracer runs used a supervisor that calls the trainer directly so it can
+restart after a hang:
 
 ```bash
 cd /scratch/$USER/cosmos-framework
@@ -265,7 +248,7 @@ export IMAGINAIRE_OUTPUT_ROOT=$PWD/outputs
 setsid nohup python3 train_supervisor.py < /dev/null > /tmp/supervisor.log 2>&1 &
 ```
 
-Underneath:
+It runs:
 
 ```bash
 .venv/bin/torchrun --nproc_per_node=8 \
@@ -279,35 +262,39 @@ Underneath:
   trainer.run_validation_on_start=False
 ```
 
-Those trailing values are the **effective** ones — they beat the TOML and the
-experiment file. Two to understand before copying:
+Those trailing values override the TOML and the experiment file.
 
-- `max_samples_per_batch=96` was tuned for 80 GB cards. On 48 GB start much
-  lower and raise it from observed memory, not from this number.
-- `max_iter=100000` is a safety ceiling. Early stopping should end the run.
+`max_samples_per_batch=96` was tuned for 80 GB cards. On 48 GB start lower and
+raise it from observed memory.
 
-`setsid` matters — plain `nohup` still dies when your SSH session drops.
+`max_iter=100000` is a ceiling. Early stopping ends the run.
 
-### Why a supervisor rather than the launcher
+Use `setsid`. Plain `nohup` still dies when your SSH session drops.
 
-| component | what it handles |
-|---|---|
-| `stall_watchdog.py` | NCCL hangs are **silent** — every GPU sits at 100% with no logs and no timeout. Only a log-progress timeout catches them. |
-| `early_stopping_watchdog.py` | Epoch-aggregated patience. Raw per-check validation is too noisy to stop on directly. |
-| `prune_roboracer_checkpoints.py` | Keeps best + latest. **Required on shared storage** — checkpoints run tens of GB each. |
+### Why a supervisor
 
-> **Size validation against your smallest dataset.**
-> `max_val_iter × max_samples_per_batch` must not exceed the number of windows in
-> your **smallest** eval split. One dataset is assigned per rank, so a rank
-> holding the small one runs out of data and leaves the collective while the
-> others wait. It presents as 100% GPU utilization, no logs, no timeout — it
-> looks like broken hardware, not a config error.
+`stall_watchdog.py` catches silent NCCL hangs. Every GPU sits at 100% with no
+logs and no timeout, so only a log-progress timeout detects them.
+
+`early_stopping_watchdog.py` aggregates validation into epochs before comparing.
+Raw per-check values are too noisy to stop on.
+
+`prune_roboracer_checkpoints.py` keeps the best and latest checkpoints.
+Checkpoints run tens of GB each, so this is required on shared storage.
+
+### Validation sizing
+
+`max_val_iter × max_samples_per_batch` must not exceed the window count of your
+smallest eval split. Each rank gets one dataset, so the rank holding the smallest
+split runs out of data and leaves the collective while the others wait. It
+presents as 100% GPU utilization with no logs and no timeout, which looks like
+broken hardware rather than a config error.
 
 ---
 
-## 6 — Export
+## 6. Export
 
-Training produces DCP. Serving wants HF safetensors:
+Training writes DCP. Serving needs HF safetensors.
 
 ```bash
 python -m cosmos_framework.scripts.export_model \
@@ -317,16 +304,14 @@ python -m cosmos_framework.scripts.export_model \
   -o <output_dir>
 ```
 
-Two things that catch people:
+The flag is `--experiment`, not `--checkpoint.experiment`.
 
-- The flag is `--experiment`, not `--checkpoint.experiment`.
-- Point at the **`model/` subdirectory**, not its parent. The format detector
-  looks for `*.distcp` at the top level, and training checkpoints nest them one
-  level down.
+Point at the `model/` subdirectory. The format detector looks for `*.distcp` at
+the top level and training checkpoints nest them one level down.
 
-**Then reset the sharding degree.** The exported config carries
-`data_parallel_shard_degree=8` from training, and a single-process server cannot
-construct an 8-way-sharded model:
+Then reset the sharding degree. The exported config carries
+`data_parallel_shard_degree=8` from training, and a single-process server can't
+build an 8-way-sharded model.
 
 ```bash
 sed -i 's/"data_parallel_shard_degree": 8/"data_parallel_shard_degree": 1/' \
@@ -337,29 +322,28 @@ sed -i 's/"data_parallel_shard_degree": 8/"data_parallel_shard_degree": 1/' \
 
 ## Next
 
-Serving, quantization for embedded hardware, and driving the vehicle:
-[`roboracer_int4_deployment.md`](./roboracer_int4_deployment.md).
+[`roboracer_int4_deployment.md`](./roboracer_int4_deployment.md) covers serving,
+compression for embedded hardware, and driving the vehicle.
 
 ---
 
 ## Reading order
 
-**Adapting Cosmos 3 to a new robot:**
-1. `docs/action_policy_droid_posttrain.md` — the canonical recipe shape
-2. `docs/custom_dataset.md` — how data reaches the model
-3. `convert_roboracer_to_lerobot.py` — a worked example of the step the framework skips
-4. `action_policy_roboracer_nano.py` — a worked example of a non-arm recipe
+Adapting to a new robot:
 
-**Reproducing this policy:** §3 → §5 → §6.
+1. `docs/action_policy_droid_posttrain.md` — recipe shape
+2. `docs/custom_dataset.md` — how data reaches the model
+3. `convert_roboracer_to_lerobot.py` — the step the framework skips
+4. `action_policy_roboracer_nano.py` — a non-arm recipe
+
+Reproducing this policy: §3, §5, §6.
 
 ---
 
-## The five things that cost the most time
+## What costs the most time
 
-1. **The dataset step is entirely yours.** The framework says so; budget for it.
-2. **Use a registered action space.** Inventing your own discards the transfer.
-3. **Add validation.** The upstream recipe has none, and without it you cannot
-   tell when to stop or which checkpoint to keep.
-4. **Re-check `loss_scale` on any tier change.** It fails silently.
-5. **Split by recording session, not by frame.** Getting this wrong invalidates
-   every number you report.
+1. Building the dataset. The framework doesn't do it.
+2. Using a registered action space. Inventing one discards the transfer.
+3. Adding validation. The upstream recipe has none.
+4. Re-checking `loss_scale` after a tier change. It fails silently.
+5. Splitting by recording session. Getting it wrong invalidates your results.
