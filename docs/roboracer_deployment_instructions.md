@@ -1,4 +1,4 @@
-# Adapting Cosmos 3 to a new robot
+# Cosmos3 and RoboRacer training
 
 Cosmos 3 ships post-training recipes for robot arms (DROID, LIBERO). This
 describes what it took to point it at a 1/10-scale car, and marks which steps the
