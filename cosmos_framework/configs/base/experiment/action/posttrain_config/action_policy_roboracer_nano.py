@@ -299,7 +299,14 @@ action_policy_roboracer_nano = LazyDict(
         dataloader_val=L(PackingDataLoader)(
             audio_sample_rate=48000,
             dataset_name="action_roboracer_val",
-            max_samples_per_batch=32,
+            # Must satisfy: max_val_iter * max_samples_per_batch <= the SMALLEST
+            # eval split, in windows. RankPartitionedDataLoader gives one dataset
+            # per rank, so a rank holding the smallest split exhausts its data and
+            # leaves the collective early while the others wait -- every GPU pins
+            # at 100% with no log output and no timeout.
+            # Smallest split is pass_right: 304 frames / 3 episodes = 205 windows.
+            # 20 * 32 = 640 deadlocks; 20 * 8 = 160 fits.
+            max_samples_per_batch=8,
             max_sequence_length=None,
             patch_spatial=2,
             sound_latent_fps=0,
