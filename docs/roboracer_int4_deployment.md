@@ -16,9 +16,25 @@ directly. Step 2's launch command is the entire setup.
 
 - Your own login on `robolidar.csres.utexas.edu`.
 - The car reachable over the lab's WireGuard VPN (see step 4).
+- **Outbound internet from robolidar on first launch.** The checkpoint ships
+  weights but not tokenizer files, so the server fetches the text tokenizer for
+  `Qwen/Qwen3-VL-4B-Instruct` from Hugging Face the first time you run it. It is
+  a few MB, goes to your own `~/.cache/huggingface`, and is cached from then on.
+  No token needed — the repo is public.
 
 That's it. (A separate git checkout is only useful if you want to *edit*
 code — see the very end of this doc — not to run what's already there.)
+
+**Verified:** the launch command in step 2 was run start-to-finish from a clean
+shell and the smoke test in step 3 returned 32 valid steps, no NaN. If it fails
+for you, it is environmental — capture the traceback rather than editing the
+command.
+
+> **Making it fully offline (optional).** `model_best_4200_int4/` contains only
+> `config.json` and `model.safetensors`. Re-exporting it through
+> `quantize_int4.py` also copies the tokenizer, processor and `vision_encoder/`
+> files into the checkpoint directory, which removes the Hugging Face fetch
+> above. Worth doing if this ever has to run somewhere without internet.
 
 ## 1. Model files — no transfer needed
 
