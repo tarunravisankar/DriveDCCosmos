@@ -1,9 +1,7 @@
 # Fine-tuning Cosmos 3 into a RoboRacer driving policy
 
 How the `action_policy_roboracer_edge` run works, with pointers to every file
-that defines it. Written for someone reproducing this or adapting it to another
-vehicle.
-
+that defines it. 
 Stock Cosmos 3 ships manipulation recipes (DROID, LIBERO). Everything here is
 what had to be added for a ground vehicle.
 
