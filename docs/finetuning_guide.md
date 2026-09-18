@@ -53,6 +53,38 @@ Anything in the experiment `.py` is **not** TOML-overridable unless it appears i
 the schema whitelist — `validation_iter`, `max_val_iter` and `run_validation` in
 particular must be edited in the `.py`.
 
+### Precedence: CLI > TOML > experiment `.py`
+
+The three layers disagree, deliberately, and the last one wins. Read the
+effective value from the supervisor's `TRAIN_CMD`, not from the `.py`:
+
+| setting | experiment `.py` | TOML | supervisor CLI | **effective** |
+|---|---|---|---|---|
+| `dataloader_train.max_samples_per_batch` | 32 | 8 | **8** | **8** |
+| `trainer.max_iter` | 100 | 515000 | **515000** | 515000 |
+| `checkpoint.save_iter` | — | 200 | **200** | 200 |
+| `trainer.logging_iter` | 1 | **10** | — | 10 |
+| `job.name` | — | `..._v1` | **`..._v3`** | `..._v3` |
+
+Quoting `max_samples_per_batch=32` from the `.py` is the easiest mistake to make
+here — the reference run trained at **8**.
+
+Two settings the TOML describes inaccurately: its header comments say
+*"on robolidar"* and *"8x A6000 48GB"*, but the reference run executed on
+**robolang with 8x H100 80GB** (`REPO=/scratch/tarunrav/cosmos-edge`,
+`CUDA_DEVICES=0..7`). The comments were written before the run moved machines.
+
+### Other run-level settings, TOML only
+
+```toml
+[model]                 precision = "bfloat16"
+[model.parallelism]     data_parallel_shard_degree = 8   # dp_replicate = 1
+[model.activation_checkpointing]  mode = "full"          # recompute to save memory
+[model.compile]         enabled = false                  # stability first
+[model.ema]             enabled = false                  # saves memory
+[scheduler]             cycle_lengths = [515000], warm_up_steps = [200]
+```
+
 ---
 
 ## Reading the experiment config
