@@ -1,4 +1,4 @@
-# Adapting Cosmos 3 to a new robot — a walkthrough
+# Adapting Cosmos 3 to a new robot
 
 Cosmos 3 ships a post-training stack built for **robot arms** (DROID, LIBERO).
 This walks through what it takes to point it at something else — in this case a
