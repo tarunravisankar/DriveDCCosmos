@@ -92,7 +92,15 @@ Straight from the upstream doc, unchanged:
 ```bash
 python -m cosmos_framework.scripts.convert_model_to_dcp \
   --checkpoint-path Cosmos3-Nano \
-  -o $BASE_CHECKPOINT_PATH
+  -o examples/checkpoints/Cosmos3-Nano
+```
+
+This is what `BASE_CHECKPOINT_PATH` points at for the roboracer run. Verify it
+worked — the output directory must contain `model/*.distcp`:
+
+```bash
+ls examples/checkpoints/Cosmos3-Nano/model/ | head
+# __0_0.distcp  __0_1.distcp  __0_2.distcp ...
 ```
 
 **Pick the right starting checkpoint.** A `*-Policy-*` variant ships a trained
@@ -153,12 +161,47 @@ flow-matching schedule.
 
 ## 4 — Launch
 
-**Upstream:** `examples/launch_sft_action_policy_droid.sh` +
+**Upstream reference:** `examples/launch_sft_action_policy_droid.sh` +
 `examples/toml/sft_config/action_policy_droid_repro.toml`. Read
-[`docs/training.md`](./training.md).
+[`docs/training.md`](./training.md) for what the launcher does.
 
-That works for a single clean run. For anything longer, **use
-`train_supervisor.py`**, which wraps the same `torchrun` invocation and adds:
+**What the roboracer run actually used.** Not the shell launcher — a supervisor
+that invokes `cosmos_framework.scripts.train` directly, so it can restart the job
+on a stall. Set three environment variables, then start it detached:
+
+```bash
+cd /scratch/$USER/cosmos-framework
+
+export BASE_CHECKPOINT_PATH=$PWD/examples/checkpoints/Cosmos3-Nano
+export WAN_VAE_PATH=$PWD/examples/checkpoints/wan22_vae/Wan2.2_VAE.pth
+export IMAGINAIRE_OUTPUT_ROOT=$PWD/outputs
+
+setsid nohup python3 train_supervisor.py < /dev/null > /tmp/supervisor.log 2>&1 &
+```
+
+Underneath, that runs:
+
+```bash
+.venv/bin/torchrun --nproc_per_node=8 \
+  -m cosmos_framework.scripts.train \
+  --sft-toml examples/toml/sft_config/action_policy_roboracer_repro.toml \
+  -- \
+  job.name=action_policy_roboracer_repro_v10 \
+  trainer.max_iter=100000 \
+  dataloader_train.max_samples_per_batch=96 \
+  checkpoint.save_iter=50 \
+  trainer.run_validation_on_start=False
+```
+
+Those trailing overrides are the **effective** values — they beat both the TOML
+and the experiment `.py`. Two worth understanding before you copy them:
+
+- `max_samples_per_batch=96` was tuned for 80 GB cards. On 48 GB, start far lower
+  and raise it from observed memory rather than guessing.
+- `max_iter=100000` is a safety ceiling only. Early stopping is what should end
+  the run.
+
+The supervisor adds three things a bare launch doesn't have:
 
 | component | why you need it |
 |---|---|
